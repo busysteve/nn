@@ -8,7 +8,7 @@ Create one `Context` on the CUDA device you want, then create tensors, layers, a
 
 Storage is dense float32. A rank-2 tensor is `(N, F)`, row-major. A rank-3 tensor is `(N, T, F)`, with the feature index contiguous. A rank-4 tensor is `(N, C, H, W)`, NCHW. `forward` and `backward` return a `const Tensor&` into storage owned by that layer. The reference stays valid until the next `forward` or `backward` on the same layer, or until the layer is destroyed. Keep values with `to_host()` or `copy_from`.
 
-`NamedParam` and `NamedBuffer` hold raw pointers into those tensors. `parameters()` and `buffers()` return a fresh vector of pointers. The storage lives as long as the owning layer does. `Sgd` copies the pointers and owns one velocity tensor per parameter.
+`NamedParam` and `NamedBuffer` hold raw pointers into those tensors. `parameters()` and `buffers()` return a fresh vector of pointers. The storage lives as long as the owning layer does. `Sgd` copies the pointers and owns one velocity tensor per parameter. `AdamW` copies them in groups and owns a first and second moment per parameter.
 
 Library failures throw `nn::Error`. Config checks throw `std::invalid_argument` whose message is the field name.
 
@@ -611,12 +611,14 @@ class Network {
   std::vector<NamedBuffer> buffers() const;
 
   void save(const std::filesystem::path& path, const Sgd* optimizer) const;
+  void save(const std::filesystem::path& path, const AdamW* optimizer) const;
   static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
 };
 
 struct Network::Loaded {
   Network network;
   std::optional<Sgd> optimizer;
+  std::optional<AdamW> adamw;
   uint64_t step = 0;
 };
 ```
@@ -668,12 +670,14 @@ class ConvResNet {
   std::vector<NamedParam> parameters() const;
   std::vector<NamedBuffer> buffers() const;
   void save(const std::filesystem::path& path, const Sgd* optimizer) const;
+  void save(const std::filesystem::path& path, const AdamW* optimizer) const;
   static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
 };
 
 struct ConvResNet::Loaded {
   ConvResNet model;
   std::optional<Sgd> optimizer;
+  std::optional<AdamW> adamw;
   uint64_t step = 0;
 };
 ```
@@ -760,6 +764,72 @@ Pass the same optimizer to `save`. `save` checks pointer identity, in order, aga
 
 Moving a `Network` or a `ConvResNet` moves the `unique_ptr<Layer>` elements. The layer objects stay where they are, so an `Sgd` built from those parameters remains valid after the move.
 
+## AdamW
+
+Header: `nn/optim.hpp`
+
+```cpp
+struct AdamWGroup {
+  std::vector<NamedParam> params;
+  float weight_decay = 0.f;
+};
+
+class AdamW {
+ public:
+  AdamW(std::vector<AdamWGroup> groups, float lr, float beta1, float beta2, float eps);
+  AdamW(std::vector<NamedParam> params, float lr, float beta1, float beta2, float eps,
+        float weight_decay);
+
+  void step();
+  void set_learning_rate(float lr);
+  float learning_rate() const;
+  float beta1() const;
+  float beta2() const;
+  float eps() const;
+  uint64_t step_count() const;
+  void set_step_count(uint64_t step);
+  const std::vector<AdamWGroup>& groups() const;
+  const std::vector<Tensor>& m() const;
+  std::vector<Tensor>& m();
+  const std::vector<Tensor>& v() const;
+  std::vector<Tensor>& v();
+};
+
+float clip_grad_norm(const std::vector<NamedParam>& params, float max_norm);
+```
+
+`AdamW` is movable and not copyable. Pass one or more groups. An empty group list, or a group with no parameters, throws `std::invalid_argument`. A non-finite learning rate, beta, epsilon, or group weight decay throws `std::invalid_argument`. The second constructor is a single group. `set_learning_rate` rejects a non-finite rate.
+
+Moments start at zero, match each parameter's shape, and live on the first parameter's context. `m()` and `v()` follow `groups()` flattened. `step()` increments the step count, then applies decoupled AdamW with that group's weight decay:
+
+```
+m = beta1 * m + (1 - beta1) * gradient
+v = beta2 * v + (1 - beta2) * gradient^2
+m_hat = m / (1 - beta1^t)
+v_hat = v / (1 - beta2^t)
+parameter = parameter - lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * parameter)
+```
+
+`t` is the step count after the increment. Bias correction uses that power.
+
+`save(path, &adamw)` writes checkpoint version 2. The flattened groups must be the network parameters in `parameters()` order, because resume splits that list by the stored group sizes. A mismatch throws `optimizer does not belong to this network`. `save(path, nullptr)` is still version 1. Pass `static_cast<const AdamW*>(nullptr)` to write version 2 with no optimizer block.
+
+`clip_grad_norm` returns the L2 norm of the gradients before scaling. It scales every non-null gradient in place by `min(1, max_norm / (total_norm + 1e-6))`. A null `grad` is skipped. An empty list returns `0` and does nothing. `max_norm <= 0` throws `std::invalid_argument`.
+
+```cpp
+std::vector<nn::NamedParam> params = net.parameters();
+nn::AdamWGroup decay;
+nn::AdamWGroup plain;
+decay.weight_decay = 0.01f;
+// Contiguous slices of parameters(), one linear layer per group.
+decay.params.assign(params.begin(), params.begin() + 2);
+plain.params.assign(params.begin() + 2, params.end());
+nn::AdamW opt({decay, plain}, 1e-3f, 0.9f, 0.999f, 1e-8f);
+nn::clip_grad_norm(net.parameters(), 1.f);
+opt.step();
+net.save(path, &opt);
+```
+
 ## Checkpoints
 
 Header: `nn/checkpoint.hpp`
@@ -769,8 +839,9 @@ enum class LoadMode { Inference, Resume };
 ```
 
 ```cpp
-network.save(path, &optimizer);  // parameters, batch-norm state, and momentum
-network.save(path, nullptr);     // parameters and batch-norm state; the stored step is 0
+network.save(path, &optimizer);  // version 1: parameters, batch-norm state, and momentum
+network.save(path, nullptr);     // version 1: parameters and batch-norm state; the stored step is 0
+network.save(path, &adamw);      // version 2: parameters, batch-norm state, and AdamW moments
 
 nn::Network::Loaded loaded = nn::Network::load(ctx, path, nn::LoadMode::Inference);
 nn::Network::Loaded resumed = nn::Network::load(ctx, path, nn::LoadMode::Resume);
@@ -778,7 +849,9 @@ nn::Network::Loaded resumed = nn::Network::load(ctx, path, nn::LoadMode::Resume)
 
 `save` synchronizes, copies device state to the host, and writes `path` with a `.tmp` suffix. It `fsync`s, closes, and renames that file onto `path`. A failure removes the temporary file and leaves an existing `path` in place. Host file errors throw `checkpoint write: ` plus `strerror`.
 
-`Loaded::network` is the rebuilt network. `Loaded::step` is the step stored in the file. `Loaded::optimizer` is set for `LoadMode::Resume`. `LoadMode::Inference` parses an optimizer block when the file has one, checks it, and leaves `optimizer` empty. `LoadMode::Resume` throws `optimizer block missing` when the file has no optimizer block. The restored network is in the train or eval mode stored in the file.
+`Loaded::network` is the rebuilt network. `Loaded::step` is the step stored in the file. `LoadMode::Resume` sets `Loaded::optimizer` for an SGD block and `Loaded::adamw` for an AdamW block. At most one is set. A version-1 file never sets `adamw`. `LoadMode::Inference` parses either optimizer block, checks it, and leaves both empty. `LoadMode::Resume` throws `optimizer block missing` when the file has no optimizer block. The restored network is in the train or eval mode stored in the file.
+
+Version 2 uses the same 32-byte header with version field `2`. When an optimizer block is present, its first field is `optimizer_kind` (`1` SGD, `2` AdamW). An SGD payload after that kind tag matches the version-1 body. An AdamW payload stores the learning rate, betas, epsilon, then each group's weight decay and moments `m` and `v` in `groups()` order. Unknown versions and unknown kinds throw.
 
 `load` checks every record before it copies any parameter to the device. A file that fails validation leaves the caller with the exception and no half-updated network.
 
@@ -786,7 +859,8 @@ nn::Network::Loaded resumed = nn::Network::load(ctx, path, nn::LoadMode::Resume)
 |---|---|
 | Unreadable, shorter than 32 bytes, or cut off mid-record | `truncated checkpoint` |
 | Wrong magic | `bad checkpoint magic` |
-| Version other than 1 | `unsupported checkpoint version N` |
+| Version other than 1 or 2 | `unsupported checkpoint version N` |
+| Version 2 optimizer kind other than 1 or 2 | `unsupported optimizer kind N` |
 | Bad train flag, optimizer flag, or reserved word | `bad checkpoint header` |
 | Family outside 1..5 | `bad checkpoint family` |
 | `ConvResNet::load` of another family | `bad checkpoint family` |
@@ -795,7 +869,7 @@ nn::Network::Loaded resumed = nn::Network::load(ctx, path, nn::LoadMode::Resume)
 | Optimizer record count disagrees | `optimizer state mismatch` |
 | `save` optimizer belongs to other parameters | `optimizer does not belong to this network` |
 
-The byte layout is version 1, little-endian, in [README.md](README.md). The file holds the config, the parameters, the batch-norm running statistics, and, when requested, the velocity. It leaves out activation caches, gradients, workspaces, and cuDNN descriptors.
+The byte layout is little-endian, in [README.md](README.md). Version 1 is the SGD checkpoint. Version 2 is the same header and model records, plus an optimizer kind tag when an optimizer is stored. The file holds the config, the parameters, the batch-norm running statistics, and, when requested, SGD velocity or AdamW moments. It leaves out activation caches, gradients, workspaces, and cuDNN descriptors.
 
 ## kaiming_normal
 

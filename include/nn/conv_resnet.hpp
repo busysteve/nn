@@ -35,6 +35,10 @@ class ConvResNet {
   void save(const std::filesystem::path& path, const Sgd* optimizer) const {
     network_.save(path, optimizer);
   }
+  void save(const std::filesystem::path& path, const AdamW* optimizer) const {
+    network_.save(path, optimizer);
+  }
+  void save(const std::filesystem::path& path, std::nullptr_t) const { network_.save(path, nullptr); }
 
   struct Loaded;
   static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
@@ -46,6 +50,7 @@ class ConvResNet {
 struct ConvResNet::Loaded {
   ConvResNet model;
   std::optional<Sgd> optimizer;
+  std::optional<AdamW> adamw;
   uint64_t step = 0;
 };
 
@@ -60,7 +65,8 @@ inline ConvResNet::Loaded ConvResNet::load(Context& ctx, const std::filesystem::
                                            LoadMode mode) {
   Network::Loaded loaded = Network::load(ctx, path, mode);
   if (loaded.network.family() != Family::ConvResNet) throw Error("bad checkpoint family");
-  return Loaded{ConvResNet(std::move(loaded.network)), std::move(loaded.optimizer), loaded.step};
+  return Loaded{ConvResNet(std::move(loaded.network)), std::move(loaded.optimizer),
+                std::move(loaded.adamw), loaded.step};
 }
 
 }  // namespace nn

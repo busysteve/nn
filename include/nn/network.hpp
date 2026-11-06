@@ -5,6 +5,7 @@
 #include "nn/layer.hpp"
 #include "nn/optim.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -40,6 +41,11 @@ class Network {
   std::vector<NamedBuffer> buffers() const;
 
   void save(const std::filesystem::path& path, const Sgd* optimizer) const;
+  void save(const std::filesystem::path& path, const AdamW* optimizer) const;
+  // nullptr stays version 1. An AdamW* (including null) is version 2.
+  void save(const std::filesystem::path& path, std::nullptr_t) const {
+    save(path, static_cast<const Sgd*>(nullptr));
+  }
 
   struct Loaded;
   static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
@@ -55,6 +61,7 @@ class Network {
 struct Network::Loaded {
   Network network;
   std::optional<Sgd> optimizer;
+  std::optional<AdamW> adamw;
   uint64_t step = 0;
 };
 

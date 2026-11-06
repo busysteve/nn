@@ -1,6 +1,6 @@
 # nn
 
-A single-GPU C++17 library that builds and trains multilayer perceptrons, convolutional networks, basic-block ResNets, and recurrent networks. `ConvResNet` is one network that can include a conv+pool trunk, residual stages, or both. Depth and width come from a config. Each trainable layer implements its own forward and backward pass. The network chains those layers. An MLP selects ReLU, GELU, or SwiGLU between its hidden linear layers. Training uses mean softmax cross-entropy and SGD with momentum. A checkpoint restores parameters, batch-norm state, the train or eval flag, and, when requested, the optimizer, so a new process can evaluate or resume training.
+A single-GPU C++17 library that builds and trains multilayer perceptrons, convolutional networks, basic-block ResNets, and recurrent networks. `ConvResNet` is one network that can include a conv+pool trunk, residual stages, or both. Depth and width come from a config. Each trainable layer implements its own forward and backward pass. The network chains those layers. An MLP selects ReLU, GELU, or SwiGLU between its hidden linear layers. Training uses mean softmax cross-entropy and either SGD with momentum or AdamW. A checkpoint restores parameters, batch-norm state, the train or eval flag, and, when requested, the optimizer, so a new process can evaluate or resume training. SGD checkpoints are version 1. AdamW checkpoints are version 2.
 
 The acceptance suite is MNIST. Public headers live under `include/nn/` and do not include CUDA, cuBLAS, or cuDNN headers.
 
@@ -599,7 +599,9 @@ Sgd(std::vector<NamedParam> params, float learning_rate, float momentum);
 
 Construct it from `network.parameters()` after the network exists. An empty list throws `SGD has no parameters`. Velocity tensors match parameter shapes and start at zero. `step_count()` starts at 0 and increases by one in `step()`.
 
-`save` checks pointer identity, in order, when an optimizer is passed. A mismatch throws `optimizer does not belong to this network`.
+`AdamW` takes parameter groups, each with its own weight decay. `step()` applies decoupled AdamW: bias-corrected moments, then `parameter - lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * parameter)`. `clip_grad_norm` scales gradients in place and returns the L2 norm from before that scale. See [USAGE.md](USAGE.md).
+
+`save` checks pointer identity, in order, when an optimizer is passed. For AdamW the flattened groups must match `parameters()` in order. A mismatch throws `optimizer does not belong to this network`.
 
 ## Checkpoint
 
@@ -613,13 +615,13 @@ Network::Loaded loaded = Network::load(ctx, path, LoadMode::Inference);
 Network::Loaded resumed = Network::load(ctx, path, LoadMode::Resume);
 ```
 
-`Loaded` contains the rebuilt `network`, an optional `optimizer`, and the stored `step`. `LoadMode::Inference` parses an optimizer block when the file has one, checks it, and discards it. `LoadMode::Resume` throws `optimizer block missing` when the flag is clear. After load, call `forward` in the restored mode for inference, or `zero_grad` and continue `step` when an optimizer was restored.
+`Loaded` contains the rebuilt `network`, an optional SGD `optimizer`, an optional `adamw`, and the stored `step`. At most one optimizer is set. `LoadMode::Inference` parses an optimizer block when the file has one, checks it, and discards it. `LoadMode::Resume` throws `optimizer block missing` when the flag is clear. A version-1 file restores SGD only. A version-2 file reads `optimizer_kind` and restores SGD (`1`) or AdamW (`2`). After load, call `forward` in the restored mode for inference, or `zero_grad` and continue `step` when an optimizer was restored.
 
 The file is little-endian. Sections are padded to 8 bytes. Strings are a `uint32` byte length, the bytes, and padding, with a maximum length of 256. The dtype tag for every tensor is `1` (float32).
 
 The file does not contain activation caches, gradients, workspaces, or cuDNN descriptors. Descriptors are rebuilt from shapes on the next forward.
 
-Magic is `0x314E4E43` (`CNN1` on disk). Version is `1`. Any other version throws `unsupported checkpoint version N`.
+Magic is `0x314E4E43` (`CNN1` on disk). Version is `1` for an SGD save and `2` for an AdamW save. Any other version throws `unsupported checkpoint version N`. Version 2 keeps this header. When the optimizer flag is set, the optimizer block starts with `optimizer_kind` (`uint32`, `1` SGD or `2` AdamW). An unknown kind throws `unsupported optimizer kind N`.
 
 ### Header (32 bytes)
 
@@ -695,13 +697,18 @@ Present only when the header flag is 1.
 
 A count or numel mismatch throws `optimizer state mismatch`.
 
+An SGD payload in version 2 is that same body, after the kind tag.
+
+An AdamW payload (kind `2`) is `lr`, `beta1`, `beta2`, `eps` (float32), `group_count` `uint32`, reserved `uint32` 0, then one record per group: `weight_decay` float32, `param_count` `uint32`, and for each parameter `numel` `uint32`, reserved 0, `m[numel]` float32, pad to 8, then `numel`, reserved 0, `v[numel]`, pad to 8. Group order is the flattened `AdamW::groups()` order, which save requires to be `parameters()` order. Resume checks each `numel` the same way it checks SGD velocity.
+
 ### Load failures
 
 | Condition | Exception message |
 |---|---|
 | Unreadable, shorter than 32 bytes, or cut off mid-record | `truncated checkpoint` |
 | Wrong magic | `bad checkpoint magic` |
-| Version other than 1 | `unsupported checkpoint version N` |
+| Version other than 1 or 2 | `unsupported checkpoint version N` |
+| Version 2 optimizer kind other than 1 or 2 | `unsupported optimizer kind N` |
 | Bad flag or reserved word | `bad checkpoint header` |
 | Family outside 1..5, or `ConvResNet::load` of another family | `bad checkpoint family` |
 | Name longer than 256 | `checkpoint tensor mismatch: name` |
@@ -777,7 +784,7 @@ Images are scaled by `1/255` into `[0, 1]`. Labels are `int64` class indices. Th
 
 `grads` compares analytic backward with central finite differences at epsilon `1e-3`, including GELU, SwiGLU, and an RNN. Parameter gradients pass when the relative error is at most `1e-2` or the absolute error is at most `1e-4`. Softmax cross-entropy uses relative `1e-5` on the scalar loss and relative `1e-4` on `grad_logits`.
 
-`ckpt` saves one small network of each family, plus GELU and SwiGLU MLPs, loads each into a new context, and compares parameter bytes and batch-norm statistics bitwise. A second eval forward matches the original logits bitwise. A truncated file and a tampered size field throw. Reloading with `LoadMode::Resume` restores momentum and the step, and one more optimizer step matches a network that was never saved.
+`ckpt` saves one small network of each family, plus GELU and SwiGLU MLPs, loads each into a new context, and compares parameter bytes and batch-norm statistics bitwise. A second eval forward matches the original logits bitwise. A truncated file and a tampered size field throw. Reloading with `LoadMode::Resume` restores momentum and the step, and one more optimizer step matches a network that was never saved. An AdamW resume on a two-layer MLP does the same for both moment tensors, and a version-1 file leaves `adamw` empty.
 
 `mnist` trains three models with seed 1, batch 128 (the last training batch has 96 examples), eval batch 256 (the last eval batch has 16), and momentum 0.9. The data order of each epoch is shuffled with `std::mt19937(1 + epoch)`.
 
@@ -793,6 +800,6 @@ At the start of the ResNet's last epoch the test zeros every `running_mean`, fil
 
 ## Scope
 
-The library is a fixed set of layers with manual backward passes, five builders, one loss, one optimizer, and one checkpoint version. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
+The library is a fixed set of layers with manual backward passes, five builders, one loss, SGD and AdamW, and checkpoint versions 1 and 2. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
 
 It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, ConvResNet models that can include a conv trunk, residual stages, or both, and Elman RNNs. Conv, ResNet, and ConvResNet builders use ReLU. The training set exercised by the suite is MNIST.

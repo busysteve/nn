@@ -106,6 +106,59 @@ void compare_state(const nn::Network& left, const nn::Network& right, const nn::
   }
 }
 
+void train_step_adamw(nn::Network& net, nn::AdamW& optimizer, nn::Context& ctx, const Batch& batch) {
+  net.train();
+  net.zero_grad();
+  nn::Tensor input(ctx, batch.shape);
+  input.copy_from_host(batch.input);
+  nn::DeviceIndices labels(ctx, static_cast<int64_t>(batch.labels.size()));
+  labels.copy_from_host(batch.labels.data(), labels.size());
+  const nn::Tensor& logits = net.forward(input);
+  nn::LossResult loss = nn::softmax_cross_entropy(ctx, logits, labels);
+  net.backward(loss.grad_logits);
+  optimizer.step();
+}
+
+nn::AdamW make_adamw(nn::Network& net) {
+  nn::AdamWGroup decay;
+  nn::AdamWGroup plain;
+  decay.weight_decay = 0.05f;
+  plain.weight_decay = 0.f;
+  for (const nn::NamedParam& param : net.parameters()) {
+    if (param.name.compare(0, 5, "fc.0.") == 0) decay.params.push_back(param);
+    else plain.params.push_back(param);
+  }
+  return nn::AdamW(std::vector<nn::AdamWGroup>{std::move(decay), std::move(plain)}, 1e-2f, 0.9f, 0.999f,
+                   1e-8f);
+}
+
+void compare_adamw(const nn::Network& left, const nn::Network& right, const nn::AdamW& left_opt,
+                   const nn::AdamW& right_opt) {
+  const std::vector<nn::NamedParam> a = left.parameters();
+  const std::vector<nn::NamedParam> b = right.parameters();
+  CHECK(a.size() == b.size());
+  for (size_t i = 0; i < a.size(); ++i) {
+    CHECK(a[i].name == b[i].name);
+    expect_bits(a[i].value->to_host(), b[i].value->to_host(), a[i].name.c_str());
+  }
+  CHECK(left_opt.step_count() == right_opt.step_count());
+  CHECK(left_opt.learning_rate() == right_opt.learning_rate());
+  CHECK(left_opt.beta1() == right_opt.beta1());
+  CHECK(left_opt.beta2() == right_opt.beta2());
+  CHECK(left_opt.eps() == right_opt.eps());
+  CHECK(left_opt.groups().size() == right_opt.groups().size());
+  for (size_t g = 0; g < left_opt.groups().size(); ++g) {
+    CHECK(left_opt.groups()[g].weight_decay == right_opt.groups()[g].weight_decay);
+    CHECK(left_opt.groups()[g].params.size() == right_opt.groups()[g].params.size());
+  }
+  CHECK(left_opt.m().size() == right_opt.m().size());
+  CHECK(left_opt.v().size() == right_opt.v().size());
+  for (size_t i = 0; i < left_opt.m().size(); ++i) {
+    expect_bits(left_opt.m()[i].to_host(), right_opt.m()[i].to_host(), "m");
+    expect_bits(left_opt.v()[i].to_host(), right_opt.v()[i].to_host(), "v");
+  }
+}
+
 void round_trip(nn::Network net, nn::Context& ctx_a, const std::filesystem::path& path, const Batch& train,
                 const Batch& probe, bool running_stats) {
   net.train();
@@ -118,6 +171,7 @@ void round_trip(nn::Network net, nn::Context& ctx_a, const std::filesystem::path
   nn::Context ctx_b;
   nn::Network::Loaded loaded = nn::Network::load(ctx_b, path, nn::LoadMode::Resume);
   CHECK(loaded.optimizer.has_value());
+  CHECK(!loaded.adamw.has_value());
   CHECK(loaded.step == 1);
   CHECK(!loaded.network.training());
   compare_state(net, loaded.network, optimizer, *loaded.optimizer, running_stats);
@@ -144,6 +198,26 @@ void write_u32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
 void write_u64(std::vector<uint8_t>& bytes, size_t offset, uint64_t value) {
   write_u32(bytes, offset, static_cast<uint32_t>(value));
   write_u32(bytes, offset + 4, static_cast<uint32_t>(value >> 32));
+}
+
+float read_f32(const std::vector<uint8_t>& bytes, size_t offset) {
+  const uint32_t bits = read_u32(bytes, offset);
+  float value = 0.f;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+void append_u32(std::vector<uint8_t>& bytes, uint32_t value) {
+  bytes.push_back(static_cast<uint8_t>(value));
+  bytes.push_back(static_cast<uint8_t>(value >> 8));
+  bytes.push_back(static_cast<uint8_t>(value >> 16));
+  bytes.push_back(static_cast<uint8_t>(value >> 24));
+}
+
+void append_f32(std::vector<uint8_t>& bytes, float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  append_u32(bytes, bits);
 }
 
 size_t align8(size_t offset) { return (offset + 7u) & ~size_t{7}; }
@@ -298,6 +372,7 @@ int test_checkpoint() {
     nn::ConvResNet::Loaded loaded = nn::ConvResNet::load(ctx, path, nn::LoadMode::Resume);
     CHECK(loaded.model.family() == nn::Family::ConvResNet);
     CHECK(loaded.optimizer.has_value());
+    CHECK(!loaded.adamw.has_value());
     CHECK(loaded.step == 1);
     CHECK(loaded.model.config().fc == config.fc);
     CHECK(loaded.model.config().convs.size() == 1);
@@ -345,10 +420,155 @@ int test_checkpoint() {
   {
     nn::Network::Loaded loaded = nn::Network::load(ctx, mlp, nn::LoadMode::Inference);
     CHECK(!loaded.optimizer.has_value());
+    CHECK(!loaded.adamw.has_value());
     CHECK(loaded.step == 1);
     expect_throw([&] { nn::ConvResNet::load(ctx, mlp, nn::LoadMode::Inference); },
                  "bad checkpoint family");
     CHECK(!loaded.network.training());
+  }
+
+  {
+    nn::MlpConfig config;
+    config.input_size = 8;
+    config.hidden = {6};
+    config.output_size = 4;
+    Batch train{{2, 8}, uniform(16, rng), {0, 1}};
+    Batch probe{{2, 8}, uniform(16, rng), {1, 0}};
+    nn::Network net = nn::build_mlp(ctx, config, 3);
+    net.train();
+    nn::AdamW optimizer = make_adamw(net);
+    const std::vector<nn::NamedParam> params = net.parameters();
+    nn::AdamWGroup swapped_decay;
+    swapped_decay.weight_decay = 0.05f;
+    swapped_decay.params = {params[2], params[3]};
+    nn::AdamWGroup swapped_plain;
+    swapped_plain.params = {params[0], params[1]};
+    nn::AdamW swapped(std::vector<nn::AdamWGroup>{std::move(swapped_decay), std::move(swapped_plain)},
+                      1e-2f, 0.9f, 0.999f, 1e-8f);
+    expect_throw([&] { net.save(dir / "adamw-order.bin", &swapped); },
+                 "optimizer does not belong to this network");
+
+    train_step_adamw(net, optimizer, ctx, train);
+    CHECK(optimizer.step_count() == 1);
+    CHECK(optimizer.groups().size() == 2);
+    CHECK(optimizer.groups()[0].weight_decay == 0.05f);
+    CHECK(optimizer.groups()[1].weight_decay == 0.f);
+    bool nonzero = false;
+    for (float value : optimizer.m()[0].to_host()) nonzero = nonzero || value != 0.f;
+    CHECK(nonzero);
+    const std::vector<float> logits = eval_logits(net, ctx, probe);
+    const std::filesystem::path path = dir / "adamw.bin";
+    net.save(path, &optimizer);
+    const std::vector<uint8_t> saved = read_bytes(path);
+    CHECK(read_u32(saved, 4) == 2);
+    CHECK(read_u32(saved, 24) == 1);
+    CHECK(read_u32(saved, optimizer_offset(saved)) == 2);
+
+    nn::Context ctx_b;
+    nn::Network::Loaded loaded = nn::Network::load(ctx_b, path, nn::LoadMode::Resume);
+    CHECK(loaded.adamw.has_value());
+    CHECK(!loaded.optimizer.has_value());
+    CHECK(loaded.step == 1);
+    CHECK(!loaded.network.training());
+    compare_adamw(net, loaded.network, optimizer, *loaded.adamw);
+    expect_bits(logits, eval_logits(loaded.network, ctx_b, probe), "adamw logits");
+
+    train_step_adamw(net, optimizer, ctx, train);
+    train_step_adamw(loaded.network, *loaded.adamw, ctx_b, train);
+    compare_adamw(net, loaded.network, optimizer, *loaded.adamw);
+
+    nn::Network::Loaded inferred = nn::Network::load(ctx, path, nn::LoadMode::Inference);
+    CHECK(!inferred.optimizer.has_value());
+    CHECK(!inferred.adamw.has_value());
+    CHECK(inferred.step == 1);
+
+    net.save(dir / "adamw-null.bin", static_cast<const nn::AdamW*>(nullptr));
+    const std::vector<uint8_t> empty_opt = read_bytes(dir / "adamw-null.bin");
+    CHECK(read_u32(empty_opt, 4) == 2);
+    CHECK(read_u32(empty_opt, 24) == 0);
+    expect_throw([&] { nn::Network::load(ctx, dir / "adamw-null.bin", nn::LoadMode::Resume); },
+                 "optimizer block missing");
+
+    std::vector<uint8_t> truncated = saved;
+    truncated.resize(optimizer_offset(truncated) + 2);
+    write_bytes(dir / "adamw-trunc.bin", truncated);
+    expect_throw([&] { nn::Network::load(ctx, dir / "adamw-trunc.bin", nn::LoadMode::Inference); },
+                 "truncated checkpoint");
+  }
+  {
+    // Kind is 4 bytes, so a v1 optimizer slice is not byte-identical: pad-to-8 is a file
+    // offset. Re-encode the same fields after the kind tag.
+    const std::vector<uint8_t> bytes = read_bytes(mlp);
+    const size_t at = optimizer_offset(bytes);
+    size_t pos = at;
+    const float learning_rate = read_f32(bytes, pos);
+    pos += 4;
+    const float momentum = read_f32(bytes, pos);
+    pos += 4;
+    const uint32_t count = read_u32(bytes, pos);
+    pos += 8;
+    std::vector<std::vector<float>> velocities(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t numel = read_u32(bytes, pos);
+      pos += 8;
+      velocities[i].resize(numel);
+      for (uint32_t j = 0; j < numel; ++j) {
+        velocities[i][j] = read_f32(bytes, pos);
+        pos += 4;
+      }
+      pos = align8(pos);
+    }
+    std::vector<uint8_t> rebuilt(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(at));
+    write_u32(rebuilt, 4, 2);
+    append_u32(rebuilt, 1);
+    append_f32(rebuilt, learning_rate);
+    append_f32(rebuilt, momentum);
+    append_u32(rebuilt, count);
+    append_u32(rebuilt, 0);
+    for (const std::vector<float>& velocity : velocities) {
+      append_u32(rebuilt, static_cast<uint32_t>(velocity.size()));
+      append_u32(rebuilt, 0);
+      for (float value : velocity) append_f32(rebuilt, value);
+      while (rebuilt.size() % 8 != 0) rebuilt.push_back(0);
+    }
+    write_bytes(dir / "v2sgd.bin", rebuilt);
+    nn::Network::Loaded from_v2 = nn::Network::load(ctx, dir / "v2sgd.bin", nn::LoadMode::Resume);
+    nn::Network::Loaded from_v1 = nn::Network::load(ctx, mlp, nn::LoadMode::Resume);
+    CHECK(from_v2.optimizer.has_value());
+    CHECK(!from_v2.adamw.has_value());
+    CHECK(!from_v1.adamw.has_value());
+    CHECK(from_v2.step == from_v1.step);
+    CHECK(from_v2.optimizer->learning_rate() == from_v1.optimizer->learning_rate());
+    CHECK(from_v2.optimizer->momentum() == from_v1.optimizer->momentum());
+    CHECK(from_v2.optimizer->step_count() == from_v1.optimizer->step_count());
+    CHECK(from_v2.optimizer->velocity().size() == from_v1.optimizer->velocity().size());
+    for (size_t i = 0; i < from_v2.optimizer->velocity().size(); ++i) {
+      expect_bits(from_v2.optimizer->velocity()[i].to_host(), from_v1.optimizer->velocity()[i].to_host(),
+                  "v2 sgd velocity");
+    }
+    const std::vector<nn::NamedParam> a = from_v2.network.parameters();
+    const std::vector<nn::NamedParam> b = from_v1.network.parameters();
+    CHECK(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+      expect_bits(a[i].value->to_host(), b[i].value->to_host(), "v2 sgd weight");
+    }
+
+    write_u32(rebuilt, at, 7);
+    write_bytes(dir / "kind.bin", rebuilt);
+    expect_throw([&] { nn::Network::load(ctx, dir / "kind.bin", nn::LoadMode::Inference); },
+                 "unsupported optimizer kind 7");
+
+    std::vector<uint8_t> bare = read_bytes(mlp);
+    bare.resize(optimizer_offset(bare));
+    write_u32(bare, 4, 2);
+    write_u64(bare, 16, 0);
+    write_u32(bare, 24, 0);
+    write_bytes(dir / "v2noopt.bin", bare);
+    expect_throw([&] { nn::Network::load(ctx, dir / "v2noopt.bin", nn::LoadMode::Resume); },
+                 "optimizer block missing");
+    nn::Network::Loaded inferred = nn::Network::load(ctx, dir / "v2noopt.bin", nn::LoadMode::Inference);
+    CHECK(!inferred.optimizer.has_value());
+    CHECK(!inferred.adamw.has_value());
   }
 
   std::printf("ckpt ok\n");
