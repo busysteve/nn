@@ -27,7 +27,7 @@ void launch_sgd(cudaStream_t stream, float* param, float* velocity, const float*
 void launch_adamw(cudaStream_t stream, float* param, float* m, float* v, const float* grad, int64_t n,
                   float lr, float beta1, float beta2, float eps, float weight_decay, float bc1,
                   float bc2);
-float launch_sum_squares(cudaStream_t stream, const float* x, int64_t n);
+double launch_sum_squares(cudaStream_t stream, const float* x, int64_t n);
 void launch_scale(cudaStream_t stream, float* x, int64_t n, float scale);
 
 }  // namespace nn

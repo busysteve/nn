@@ -311,6 +311,20 @@ int test_gradients() {
     nn::NamedParam weight_param{"weight", &weight, &grad_weight};
     nn::NamedParam bias_param{"bias", &bias, &grad_bias};
     expect_invalid([&] {
+      nn::NamedParam missing{"weight", &weight, nullptr};
+      nn::AdamW({missing}, 0.1f, 0.9f, 0.999f, 1e-8f, 0.f);
+    });
+    expect_invalid([&] {
+      nn::Tensor wide(ctx, {3});
+      nn::NamedParam mismatch{"weight", &weight, &wide};
+      nn::AdamW({mismatch}, 0.1f, 0.9f, 0.999f, 1e-8f, 0.f);
+    });
+    expect_invalid([&] {
+      nn::AdamWGroup twice;
+      twice.params = {weight_param, weight_param};
+      nn::AdamW(std::vector<nn::AdamWGroup>{twice}, 0.1f, 0.9f, 0.999f, 1e-8f);
+    });
+    expect_invalid([&] {
       nn::AdamW({weight_param}, std::numeric_limits<float>::quiet_NaN(), 0.9f, 0.999f, 1e-8f, 0.f);
     });
     expect_invalid([&] {

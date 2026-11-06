@@ -798,7 +798,7 @@ class AdamW {
 float clip_grad_norm(const std::vector<NamedParam>& params, float max_norm);
 ```
 
-`AdamW` is movable and not copyable. Pass one or more groups. An empty group list, or a group with no parameters, throws `std::invalid_argument`. A non-finite learning rate, beta, epsilon, or group weight decay throws `std::invalid_argument`. The second constructor is a single group. `set_learning_rate` rejects a non-finite rate.
+`AdamW` is movable and not copyable. Pass one or more groups. An empty group list, or a group with no parameters, throws `std::invalid_argument`. So does a null value or gradient, a gradient whose element count differs from its parameter, or the same parameter listed twice. A non-finite learning rate, beta, epsilon, or group weight decay throws `std::invalid_argument`. The second constructor is a single group. `set_learning_rate` rejects a non-finite rate.
 
 Moments start at zero, match each parameter's shape, and live on the first parameter's context. `m()` and `v()` follow `groups()` flattened. `step()` increments the step count, then applies decoupled AdamW with that group's weight decay:
 

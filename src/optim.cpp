@@ -51,11 +51,18 @@ AdamW::AdamW(std::vector<AdamWGroup> groups, float lr, float beta1, float beta2,
   require_finite(eps_, "eps");
   Context* ctx = nullptr;
   size_t count = 0;
+  std::vector<const Tensor*> seen;
   for (const AdamWGroup& group : groups_) {
     if (group.params.empty()) throw std::invalid_argument("params");
     require_finite(group.weight_decay, "weight_decay");
     for (const NamedParam& param : group.params) {
-      if (!param.value) throw std::invalid_argument("params");
+      if (!param.value || !param.grad || param.grad->numel() != param.value->numel()) {
+        throw std::invalid_argument("params");
+      }
+      for (const Tensor* previous : seen) {
+        if (previous == param.value) throw std::invalid_argument("params");
+      }
+      seen.push_back(param.value);
       if (!ctx) ctx = &param.value->context();
       ++count;
     }
@@ -100,10 +107,9 @@ float clip_grad_norm(const std::vector<NamedParam>& params, float max_norm) {
   double sum_sq = 0.0;
   for (const NamedParam& param : params) {
     if (!param.grad) continue;
-    sum_sq += static_cast<double>(launch_sum_squares(stream_of(param.grad->context()), param.grad->data(),
-                                                     param.grad->numel()));
+    sum_sq += launch_sum_squares(stream_of(param.grad->context()), param.grad->data(), param.grad->numel());
   }
-  const float total = std::sqrt(static_cast<float>(sum_sq));
+  const float total = static_cast<float>(std::sqrt(sum_sq));
   const float scale = std::min(1.f, max_norm / (total + 1e-6f));
   for (const NamedParam& param : params) {
     if (!param.grad) continue;

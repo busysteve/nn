@@ -167,10 +167,12 @@ classDiagram
     class ConvResNetLoaded["ConvResNet::Loaded"] {
         +model
         +optimizer Sgd
+        +adamw AdamW
         +step
     }
     ConvResNetLoaded *-- ConvResNet
     ConvResNetLoaded o-- Sgd
+    ConvResNetLoaded o-- AdamW
 
     class Sgd {
         +step()
@@ -181,6 +183,15 @@ classDiagram
     Sgd --> NamedParam : borrows
     Sgd *-- Tensor : velocity
 
+    class AdamW {
+        +step()
+        +groups
+        +m Tensor
+        +v Tensor
+    }
+    AdamW --> NamedParam : borrows
+    AdamW *-- Tensor : moments
+
     class LossResult {
         +loss
         +grad_logits Tensor
@@ -190,10 +201,12 @@ classDiagram
     class Loaded {
         +network
         +optimizer Sgd
+        +adamw AdamW
         +step
     }
     Loaded *-- Network
     Loaded o-- Sgd
+    Loaded o-- AdamW
 ```
 
 ## Ownership
@@ -328,7 +341,7 @@ model.save(path, &optimizer);
 nn::ConvResNet::Loaded loaded = nn::ConvResNet::load(ctx, path, nn::LoadMode::Resume);
 ```
 
-`ConvResNet` forwards `forward`, `backward`, `train`, `eval`, `zero_grad`, `parameters`, and `buffers` to the network it owns. Constructing it from a `Network` of another family throws `ConvResNet family`. `ConvResNet::load` throws `bad checkpoint family` when the file is another family. `save` writes family `4` in the same version-1 checkpoint.
+`ConvResNet` forwards `forward`, `backward`, `train`, `eval`, `zero_grad`, `parameters`, and `buffers` to the network it owns. Constructing it from a `Network` of another family throws `ConvResNet family`. `ConvResNet::load` throws `bad checkpoint family` when the file is another family. `save` with an `Sgd*` or `nullptr` writes family `4` in a version-1 checkpoint. `save(const AdamW*)` writes family `4` in a version-2 checkpoint.
 
 ### RnnConfig
 
@@ -628,7 +641,7 @@ Magic is `0x314E4E43` (`CNN1` on disk). Version is `1` for an SGD save and `2` f
 | Offset | Type | Meaning |
 |---:|---|---|
 | 0 | `uint32` | Magic `0x314E4E43`. |
-| 4 | `uint32` | Version `1`. |
+| 4 | `uint32` | Version `1` (SGD or no optimizer) or `2` (AdamW). |
 | 8 | `uint32` | Family: `1` MLP, `2` conv, `3` ResNet, `4` ConvResNet, `5` RNN. |
 | 12 | `uint32` | Train flag: `1` train, `0` eval. |
 | 16 | `uint64` | Optimizer step, or 0 when no optimizer is saved. |
