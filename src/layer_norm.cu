@@ -110,25 +110,6 @@ __global__ void layer_norm_param_grad_kernel(const float* dy, const float* x, co
   }
 }
 
-void launch_layer_norm_forward(cudaStream_t stream, float* y, float* mean, float* inv_std,
-                               const float* x, const float* gamma, const float* beta, int rows,
-                               int cols, float eps) {
-  layer_norm_forward_kernel<<<rows, kThreads, 0, stream>>>(y, mean, inv_std, x, gamma, beta, cols,
-                                                           eps);
-  check_cuda(cudaGetLastError(), "layer_norm_forward");
-}
-
-void launch_layer_norm_backward(cudaStream_t stream, float* dx, float* grad_gamma, float* grad_beta,
-                                const float* dy, const float* x, const float* mean,
-                                const float* inv_std, const float* gamma, int rows, int cols) {
-  layer_norm_backward_input_kernel<<<rows, kThreads, 0, stream>>>(dx, dy, x, mean, inv_std, gamma,
-                                                                  cols);
-  check_cuda(cudaGetLastError(), "layer_norm_backward_input");
-  layer_norm_param_grad_kernel<<<cols, kThreads, 0, stream>>>(dy, x, mean, inv_std, grad_gamma,
-                                                              grad_beta, rows, cols);
-  check_cuda(cudaGetLastError(), "layer_norm_backward_param");
-}
-
 int normalized_rows(const Tensor& input, int normalized_shape) {
   const std::vector<int>& shape = input.shape();
   if ((shape.size() != 2 && shape.size() != 3) || shape.back() != normalized_shape) {
@@ -177,9 +158,10 @@ const Tensor& LayerNorm::forward(const Tensor& input) {
   ensure_tensor(mean_, *ctx_, std::vector<int>{rows});
   ensure_tensor(inv_std_, *ctx_, std::vector<int>{rows});
   cache_x_->copy_from(input);
-  launch_layer_norm_forward(stream_of(*ctx_), output_->data(), mean_->data(), inv_std_->data(),
-                            cache_x_->data(), weight_.data(), bias_.data(), rows,
-                            normalized_shape_, eps_);
+  layer_norm_forward_kernel<<<rows, kThreads, 0, stream_of(*ctx_)>>>(
+      output_->data(), mean_->data(), inv_std_->data(), cache_x_->data(), weight_.data(),
+      bias_.data(), normalized_shape_, eps_);
+  check_cuda(cudaGetLastError(), "layer_norm_forward");
   return *output_;
 }
 
@@ -189,9 +171,15 @@ const Tensor& LayerNorm::backward(const Tensor& grad_output) {
   }
   const int rows = static_cast<int>(mean_->numel());
   ensure_tensor(grad_input_, *ctx_, cache_x_->shape());
-  launch_layer_norm_backward(stream_of(*ctx_), grad_input_->data(), grad_weight_.data(),
-                             grad_bias_.data(), grad_output.data(), cache_x_->data(), mean_->data(),
-                             inv_std_->data(), weight_.data(), rows, normalized_shape_);
+  cudaStream_t stream = stream_of(*ctx_);
+  layer_norm_backward_input_kernel<<<rows, kThreads, 0, stream>>>(
+      grad_input_->data(), grad_output.data(), cache_x_->data(), mean_->data(), inv_std_->data(),
+      weight_.data(), normalized_shape_);
+  check_cuda(cudaGetLastError(), "layer_norm_backward_input");
+  layer_norm_param_grad_kernel<<<normalized_shape_, kThreads, 0, stream>>>(
+      grad_output.data(), cache_x_->data(), mean_->data(), inv_std_->data(), grad_weight_.data(),
+      grad_bias_.data(), rows, normalized_shape_);
+  check_cuda(cudaGetLastError(), "layer_norm_backward_param");
   return *grad_input_;
 }
 
