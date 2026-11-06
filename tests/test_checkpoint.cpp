@@ -240,6 +240,21 @@ int test_checkpoint() {
     CHECK(loaded.network.parameters()[0].value->shape() == std::vector<int>({12, 8}));
   }
   {
+    nn::RnnConfig config;
+    config.input_size = 4;
+    config.hidden = {3, 5};
+    config.output_size = 4;
+    Batch train{{2, 3, 4}, uniform(24, rng), {0, 1}};
+    Batch probe{{2, 3, 4}, uniform(24, rng), {1, 0}};
+    round_trip(nn::build_rnn(ctx, config, 1), ctx, dir / "rnn.bin", train, probe, false);
+    nn::Network::Loaded loaded = nn::Network::load(ctx, dir / "rnn.bin", nn::LoadMode::Inference);
+    CHECK(loaded.network.family() == nn::Family::Rnn);
+    const nn::RnnConfig& restored = std::get<nn::RnnConfig>(loaded.network.config());
+    CHECK(restored.hidden.size() == 2);
+    CHECK(restored.hidden[1] == 5);
+    CHECK(loaded.network.parameters()[0].value->shape() == std::vector<int>({3, 4}));
+  }
+  {
     nn::ConvConfig config;
     config.in_channels = 1;
     config.in_height = 8;

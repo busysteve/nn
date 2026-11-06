@@ -59,11 +59,18 @@ struct ConvResNetConfig {
   std::vector<int> fc;
 };
 
+struct RnnConfig {
+  int input_size = 0;
+  std::vector<int> hidden;
+  int output_size = 0;
+};
+
 int conv_out_size(int in, int kernel, int stride, int pad);
 
 void validate(const MlpConfig& config);
 void validate(const ConvConfig& config);
 void validate(const ResNetConfig& config);
 void validate(const ConvResNetConfig& config);
+void validate(const RnnConfig& config);
 
 }  // namespace nn

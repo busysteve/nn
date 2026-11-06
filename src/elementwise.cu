@@ -97,6 +97,38 @@ __global__ void swiglu_backward_kernel(float* grad_x, const float* x, const floa
   grad_x[base + inner] = dy * silu(gate);
 }
 
+__global__ void tanh_kernel(float* y, const float* x, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = tanhf(x[i]);
+}
+
+__global__ void tanh_backward_kernel(float* grad_x, const float* y, const float* grad_y, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float h = y[i];
+  grad_x[i] = grad_y[i] * (1.f - h * h);
+}
+
+__global__ void gather_time_kernel(float* dst, const float* src, int batch, int time, int features,
+                                   int index) {
+  const int64_t n = static_cast<int64_t>(batch) * features;
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int64_t row = i / features;
+  const int64_t col = i - row * features;
+  dst[i] = src[(row * time + index) * features + col];
+}
+
+__global__ void scatter_time_kernel(float* dst, const float* src, int batch, int time, int features,
+                                    int index) {
+  const int64_t n = static_cast<int64_t>(batch) * features;
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int64_t row = i / features;
+  const int64_t col = i - row * features;
+  dst[(row * time + index) * features + col] = src[i];
+}
+
 int blocks_for(int64_t n) {
   const int64_t blocks = (n + 255) / 256;
   if (blocks > 0x7fffffffLL) return 0x7fffffff;
@@ -150,6 +182,35 @@ void launch_swiglu_backward(cudaStream_t stream, float* grad_x, const float* x, 
   if (n <= 0) return;
   swiglu_backward_kernel<<<blocks_for(n), 256, 0, stream>>>(grad_x, x, grad_y, rows, inner);
   check_cuda(cudaGetLastError(), "swiglu_backward");
+}
+
+void launch_tanh(cudaStream_t stream, float* y, const float* x, int64_t n) {
+  if (n <= 0) return;
+  tanh_kernel<<<blocks_for(n), 256, 0, stream>>>(y, x, n);
+  check_cuda(cudaGetLastError(), "tanh");
+}
+
+void launch_tanh_backward(cudaStream_t stream, float* grad_x, const float* y, const float* grad_y,
+                          int64_t n) {
+  if (n <= 0) return;
+  tanh_backward_kernel<<<blocks_for(n), 256, 0, stream>>>(grad_x, y, grad_y, n);
+  check_cuda(cudaGetLastError(), "tanh_backward");
+}
+
+void launch_gather_time(cudaStream_t stream, float* dst, const float* src, int batch, int time,
+                        int features, int index) {
+  const int64_t n = static_cast<int64_t>(batch) * features;
+  if (n <= 0) return;
+  gather_time_kernel<<<blocks_for(n), 256, 0, stream>>>(dst, src, batch, time, features, index);
+  check_cuda(cudaGetLastError(), "gather_time");
+}
+
+void launch_scatter_time(cudaStream_t stream, float* dst, const float* src, int batch, int time,
+                         int features, int index) {
+  const int64_t n = static_cast<int64_t>(batch) * features;
+  if (n <= 0) return;
+  scatter_time_kernel<<<blocks_for(n), 256, 0, stream>>>(dst, src, batch, time, features, index);
+  check_cuda(cudaGetLastError(), "scatter_time");
 }
 
 }  // namespace nn

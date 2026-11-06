@@ -112,4 +112,11 @@ void validate(const ConvResNetConfig& config) {
   }
 }
 
+void validate(const RnnConfig& config) {
+  require_positive(config.input_size, "input_size");
+  require_positive(config.output_size, "output_size");
+  if (config.hidden.empty()) bad("hidden");
+  for (int width : config.hidden) require_positive(width, "hidden");
+}
+
 }  // namespace nn

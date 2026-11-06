@@ -5,10 +5,12 @@
 #include "nn/layers/flatten.hpp"
 #include "nn/layers/gelu.hpp"
 #include "nn/layers/global_avg_pool2d.hpp"
+#include "nn/layers/last_step.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/max_pool2d.hpp"
 #include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
+#include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
 
 #include <random>
@@ -180,6 +182,24 @@ Network build_conv_resnet(Context& ctx, const ConvResNetConfig& config, uint32_t
     features = config.fc[i];
   }
   return Network(ctx, Family::ConvResNet, std::move(layers), config);
+}
+
+Network build_rnn(Context& ctx, const RnnConfig& config, uint32_t seed) {
+  validate(config);
+  std::mt19937 rng(seed);
+  std::vector<std::unique_ptr<Layer>> layers;
+  int features = config.input_size;
+  for (size_t i = 0; i < config.hidden.size(); ++i) {
+    auto rnn = std::make_unique<RNN>(ctx, features, config.hidden[i], rng);
+    rnn->set_name(index_name("rnn", i));
+    layers.push_back(std::move(rnn));
+    features = config.hidden[i];
+  }
+  layers.push_back(std::make_unique<LastStep>());
+  auto head = std::make_unique<Linear>(ctx, features, config.output_size, rng);
+  head->set_name("head");
+  layers.push_back(std::move(head));
+  return Network(ctx, Family::Rnn, std::move(layers), config);
 }
 
 }  // namespace nn

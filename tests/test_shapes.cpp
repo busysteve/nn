@@ -5,8 +5,10 @@
 #include "nn/error.hpp"
 #include "nn/layers/conv2d.hpp"
 #include "nn/layers/gelu.hpp"
+#include "nn/layers/last_step.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/residual_block.hpp"
+#include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
 
 #include <cmath>
@@ -320,6 +322,74 @@ int test_shapes() {
     expect_invalid([&] { nn::validate(config); }, "activation");
     config.activation = nn::Activation::SwiGLU;
     config.hidden = {1 << 30};
+    expect_invalid([&] { nn::validate(config); }, "hidden");
+  }
+
+  {
+    nn::LastStep layer;
+    const std::vector<float> host = {0.f, 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f, 9.f, 10.f, 11.f};
+    nn::Tensor input(ctx, {2, 3, 2});
+    input.copy_from_host(host);
+    const nn::Tensor& output = layer.forward(input);
+    CHECK(output.shape() == std::vector<int>({2, 2}));
+    expect_close(output.to_host(), {4.f, 5.f, 10.f, 11.f}, "last-step");
+    nn::Tensor grad(ctx, {2, 2});
+    grad.copy_from_host(std::vector<float>{1.f, 2.f, 3.f, 4.f});
+    const std::vector<float> got = layer.backward(grad).to_host();
+    expect_close(got, {0.f, 0.f, 0.f, 0.f, 1.f, 2.f, 0.f, 0.f, 0.f, 0.f, 3.f, 4.f}, "last-step-grad");
+    nn::Tensor bad_rank(ctx, {2, 3});
+    expect_error([&] { layer.forward(bad_rank); }, "LastStep input rank");
+    nn::LastStep fresh;
+    expect_error([&] { fresh.backward(grad); }, "LastStep backward without forward");
+  }
+
+  {
+    nn::RNN layer(ctx, 1, 1, rng);
+    std::vector<nn::NamedParam> params = layer.parameters();
+    CHECK(params.size() == 4);
+    params[0].value->copy_from_host(std::vector<float>{1.f});
+    params[1].value->copy_from_host(std::vector<float>{1.f});
+    params[2].value->fill(0.f);
+    params[3].value->fill(0.f);
+    nn::Tensor input(ctx, {1, 2, 1});
+    input.copy_from_host(std::vector<float>{0.5f, 0.25f});
+    const float h0 = std::tanh(0.5f);
+    const float h1 = std::tanh(0.25f + h0);
+    const nn::Tensor& output = layer.forward(input);
+    CHECK(output.shape() == std::vector<int>({1, 2, 1}));
+    expect_close(output.to_host(), {h0, h1}, "rnn");
+    nn::Tensor grad(ctx, {1, 2, 1});
+    grad.fill(1.f);
+    CHECK(layer.backward(grad).shape() == input.shape());
+    nn::Tensor bad_rank(ctx, {1, 1});
+    expect_error([&] { layer.forward(bad_rank); }, "RNN input shape");
+    expect_error([&] { nn::RNN bad(ctx, 0, 1, rng); }, "RNN size");
+  }
+
+  {
+    nn::RnnConfig config;
+    config.input_size = 3;
+    config.hidden = {4, 6};
+    config.output_size = 2;
+    nn::Network net = nn::build_rnn(ctx, config, 1);
+    expect_params(net, {{"rnn.0.weight_ih", {4, 3}},
+                        {"rnn.0.weight_hh", {4, 4}},
+                        {"rnn.0.bias_ih", {4}},
+                        {"rnn.0.bias_hh", {4}},
+                        {"rnn.1.weight_ih", {6, 4}},
+                        {"rnn.1.weight_hh", {6, 6}},
+                        {"rnn.1.bias_ih", {6}},
+                        {"rnn.1.bias_hh", {6}},
+                        {"head.weight", {2, 6}},
+                        {"head.bias", {2}}});
+    check_io(ctx, net, {2, 5, 3}, {2, 2});
+    CHECK(net.family() == nn::Family::Rnn);
+  }
+
+  {
+    nn::RnnConfig config;
+    config.input_size = 4;
+    config.output_size = 2;
     expect_invalid([&] { nn::validate(config); }, "hidden");
   }
 

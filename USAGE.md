@@ -6,7 +6,7 @@ Link the CMake target `nn`. It carries `CUDA::cudart` and `CUDA::cublas`. A prog
 
 Create one `Context` on the CUDA device you want, then create tensors, layers, and the optimizer from that context. Destroy those objects before the context. The context uses the device that is current when it is constructed, and it owns one stream. `synchronize()` waits for that stream.
 
-Storage is dense float32. A rank-2 tensor is `(N, F)`, row-major. A rank-4 tensor is `(N, C, H, W)`, NCHW. `forward` and `backward` return a `const Tensor&` into storage owned by that layer. The reference stays valid until the next `forward` or `backward` on the same layer, or until the layer is destroyed. Keep values with `to_host()` or `copy_from`.
+Storage is dense float32. A rank-2 tensor is `(N, F)`, row-major. A rank-3 tensor is `(N, T, F)`, with the feature index contiguous. A rank-4 tensor is `(N, C, H, W)`, NCHW. `forward` and `backward` return a `const Tensor&` into storage owned by that layer. The reference stays valid until the next `forward` or `backward` on the same layer, or until the layer is destroyed. Keep values with `to_host()` or `copy_from`.
 
 `NamedParam` and `NamedBuffer` hold raw pointers into those tensors. `parameters()` and `buffers()` return a fresh vector of pointers. The storage lives as long as the owning layer does. `Sgd` copies the pointers and owns one velocity tensor per parameter.
 
@@ -45,7 +45,7 @@ net.save("mlp.bin", nullptr);
 
 Weight and bias gradients accumulate. Call `zero_grad` once per step. A new network is in train mode. Call `eval()` before inference when the network contains batch-norm.
 
-For an image network, `input` is rank 4: `(N, in_channels, in_height, in_width)`.
+For an image network, `input` is rank 4: `(N, in_channels, in_height, in_width)`. For a recurrent network, `input` is rank 3: `(N, T, input_size)`. `build_rnn` returns logits of shape `(N, output_size)`.
 
 ## Error
 
@@ -266,6 +266,41 @@ SiLU(a) = a * sigmoid(a)
 ```
 
 Any other rank throws `SwiGLU rank`. An odd size on dimension 1 throws `SwiGLU size`. `forward` stores the input. `backward` returns the input shape. A gradient whose shape differs from the forward output throws `SwiGLU backward shape`. `zero_grad` is empty.
+
+### RNN
+
+Header: `nn/layers/rnn.hpp`
+
+```cpp
+RNN(Context& ctx, int input_size, int hidden_size, std::mt19937& rng);
+```
+
+`input_size` and `hidden_size` are at least 1. A smaller value throws `RNN size`. `weight_ih` is drawn with fan-in `input_size`. `weight_hh` is drawn with fan-in `hidden_size`. Both biases start at zero and consume no random numbers.
+
+| Tensor | Shape | Name |
+|---|---|---|
+| weight_ih | `(hidden_size, input_size)` | `weight_ih` |
+| weight_hh | `(hidden_size, hidden_size)` | `weight_hh` |
+| bias_ih | `(hidden_size)` | `bias_ih` |
+| bias_hh | `(hidden_size)` | `bias_hh` |
+
+`forward` takes `(N, T, input_size)` and returns `(N, T, hidden_size)`. The hidden state before step 0 is zero.
+
+```
+h_t = tanh(x_t * W_ih^T + b_ih + h_{t-1} * W_hh^T + b_hh)
+```
+
+A rank other than 3, or a feature count other than `input_size`, throws `RNN input shape`. `backward` walks the sequence from the last step to the first, returns `(N, T, input_size)`, and adds into all four gradients. A gradient whose shape differs from the forward output, including a backward with no forward, throws `RNN backward shape`.
+
+### LastStep
+
+Header: `nn/layers/last_step.hpp`
+
+```cpp
+class LastStep : public Layer { /* default constructor */ };
+```
+
+No parameters. `forward` takes `(N, T, F)` and returns `(N, F)`, the values at time `T - 1`. A rank other than 3 throws `LastStep input rank`. `backward` writes the incoming gradient into that last step and leaves every earlier step at zero. Call `forward` first. A backward with no forward throws `LastStep backward without forward`. A mismatched gradient throws `LastStep backward shape`. `zero_grad` is empty.
 
 ### Conv2d
 
@@ -524,17 +559,44 @@ Names match the other builders: `conv.i`, `pool.i`, `stem`, `stem.bn`, `stages.{
 
 Random draws follow construction order. Each `conv.i.weight` is drawn, then `stem.weight` when the stem is present, then each block's `conv1.weight`, `conv2.weight`, and `proj.weight` when that block projects, then each `fc.i.weight`.
 
+### RnnConfig
+
+```cpp
+struct RnnConfig {
+  int input_size = 0;
+  std::vector<int> hidden;
+  int output_size = 0;
+};
+```
+
+`input_size` and `output_size` are at least 1. `hidden` is nonempty, and every width is at least 1. An empty list or a width below 1 throws `hidden`.
+
+`build_rnn` emits one `RNN` per hidden width, named `rnn.i`, then `LastStep`, then `Linear` named `head`. Layer 0 reads `input_size`. Layer `k` reads `hidden[k - 1]`. The state before the first step is zero and is not a parameter. Each layer reads the full sequence from the layer below. `LastStep` keeps time `T - 1`. The head maps that vector to `output_size`.
+
+Input shape is `(N, T, input_size)`. Output shape is `(N, output_size)`. `T` is at least 1. Labels for `softmax_cross_entropy` have length `N`.
+
+Random draws follow construction order. For each recurrent layer, `rnn.i.weight_ih` is drawn with fan-in equal to that layer's input width, then `rnn.i.weight_hh` with fan-in equal to its hidden width, then `head.weight`.
+
+```cpp
+config.input_size = 8;
+config.hidden = {6, 4};
+config.output_size = 3;
+nn::Network net = nn::build_rnn(ctx, config, /*seed=*/1);
+nn::Tensor sequence(ctx, {32, 10, 8});
+const nn::Tensor& logits = net.forward(sequence);  // (32, 3)
+```
+
 ## Network
 
 Header: `nn/network.hpp`
 
 ```cpp
-enum class Family : uint32_t { Mlp = 1, Conv = 2, ResNet = 3, ConvResNet = 4 };
+enum class Family : uint32_t { Mlp = 1, Conv = 2, ResNet = 3, ConvResNet = 4, Rnn = 5 };
 
 class Network {
  public:
   Network(Context& ctx, Family family, std::vector<std::unique_ptr<Layer>> layers,
-          std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig> config);
+          std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig> config);
 
   const Tensor& forward(const Tensor& input);
   const Tensor& backward(const Tensor& grad_output);
@@ -543,7 +605,7 @@ class Network {
   void eval();
   bool training() const;
   Family family() const;
-  const std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig>& config() const;
+  const std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig>& config() const;
 
   std::vector<NamedParam> parameters() const;
   std::vector<NamedBuffer> buffers() const;
@@ -566,6 +628,7 @@ Network build_mlp(Context& ctx, const MlpConfig& config, uint32_t seed);
 Network build_conv(Context& ctx, const ConvConfig& config, uint32_t seed);
 Network build_resnet(Context& ctx, const ResNetConfig& config, uint32_t seed);
 Network build_conv_resnet(Context& ctx, const ConvResNetConfig& config, uint32_t seed);
+Network build_rnn(Context& ctx, const RnnConfig& config, uint32_t seed);
 ```
 
 `Network` is movable and not copyable. The usual construction is a builder. Each builder validates the config, seeds one `std::mt19937`, and returns a network in train mode. `load` rebuilds with seed 0 and then overwrites every parameter from the file, so the seed used at load time leaves the restored weights unchanged.
@@ -576,9 +639,9 @@ Network build_conv_resnet(Context& ctx, const ConvResNetConfig& config, uint32_t
 
 `zero_grad()` zeros every parameter gradient. It leaves parameters, velocity, and batch-norm buffers unchanged.
 
-`config()` returns the variant stored at construction. Read it with `std::get<MlpConfig>`, `std::get<ConvConfig>`, `std::get<ResNetConfig>`, or `std::get<ConvResNetConfig>`.
+`config()` returns the variant stored at construction. Read it with `std::get<MlpConfig>`, `std::get<ConvConfig>`, `std::get<ResNetConfig>`, `std::get<ConvResNetConfig>`, or `std::get<RnnConfig>`.
 
-The public constructor is for a caller who already owns the layers. `save` writes `family` and `config`. `load` rebuilds with the builder for that family, then requires the parameter and batch-norm records to match that builder's names and shapes. A checkpoint round-trip is defined for a network produced by one of the four builders.
+The public constructor is for a caller who already owns the layers. `save` writes `family` and `config`. `load` rebuilds with the builder for that family, then requires the parameter and batch-norm records to match that builder's names and shapes. A checkpoint round-trip is defined for a network produced by one of the five builders.
 
 ## ConvResNet
 
@@ -725,7 +788,7 @@ nn::Network::Loaded resumed = nn::Network::load(ctx, path, nn::LoadMode::Resume)
 | Wrong magic | `bad checkpoint magic` |
 | Version other than 1 | `unsupported checkpoint version N` |
 | Bad train flag, optimizer flag, or reserved word | `bad checkpoint header` |
-| Family outside 1..4 | `bad checkpoint family` |
+| Family outside 1..5 | `bad checkpoint family` |
 | `ConvResNet::load` of another family | `bad checkpoint family` |
 | Parameter or batch-norm record disagrees with the rebuilt network | `checkpoint tensor mismatch: ...` |
 | `Resume` and the optimizer flag is 0 | `optimizer block missing` |
@@ -742,4 +805,4 @@ Header: `nn/init.hpp`
 void kaiming_normal(Tensor& weight, int fan_in, std::mt19937& rng);
 ```
 
-Fills `weight` with a normal distribution of mean 0 and standard deviation `sqrt(2 / fan_in)`, then synchronizes. `fan_in` is at least 1 (`kaiming fan_in`). `Linear` uses `in_features`. `Conv2d` uses `in_channels * kernel * kernel`. Builders call this for you. Call it when you construct a `Linear` or `Conv2d` yourself and want to draw again into an existing weight tensor.
+Fills `weight` with a normal distribution of mean 0 and standard deviation `sqrt(2 / fan_in)`, then synchronizes. `fan_in` is at least 1 (`kaiming fan_in`). `Linear` uses `in_features`. `Conv2d` uses `in_channels * kernel * kernel`. `RNN` uses `input_size` for `weight_ih` and `hidden_size` for `weight_hh`. Builders call this for you. Call it when you construct a `Linear`, `Conv2d`, or `RNN` yourself and want to draw again into an existing weight tensor.

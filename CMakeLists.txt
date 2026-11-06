@@ -36,6 +36,8 @@ add_library(nn STATIC
   src/relu.cpp
   src/gelu.cpp
   src/swiglu.cpp
+  src/rnn.cpp
+  src/last_step.cpp
   src/conv2d.cpp
   src/max_pool2d.cpp
   src/batch_norm2d.cpp

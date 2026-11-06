@@ -3,10 +3,12 @@
 #include "nn/layers/batch_norm2d.hpp"
 #include "nn/layers/conv2d.hpp"
 #include "nn/layers/gelu.hpp"
+#include "nn/layers/last_step.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/max_pool2d.hpp"
 #include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
+#include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
 #include "nn/loss.hpp"
 
@@ -167,6 +169,25 @@ int test_gradients() {
     nn::SwiGLU layer(ctx);
     nn::Tensor input(ctx, {2, 2, 2, 2});
     input.copy_from_host(uniform(input.numel(), rng, -0.8f, 0.8f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad last step\n");
+  {
+    nn::LastStep layer;
+    nn::Tensor input(ctx, {2, 3, 2});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad rnn\n");
+  {
+    nn::RNN layer(ctx, 3, 2, rng);
+    for (nn::NamedParam param : layer.parameters()) {
+      if (param.name.find("weight") != std::string::npos) param.value->fill(0.2f);
+    }
+    nn::Tensor input(ctx, {2, 3, 3});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
     check_layer(layer, input);
   }
 
