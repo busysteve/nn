@@ -29,10 +29,12 @@ add_library(nn STATIC
   src/context.cpp
   src/error.cpp
   src/tensor.cpp
+  src/index_tensor.cpp
   src/init.cpp
   src/config.cpp
   src/elementwise.cu
   src/linear.cpp
+  src/embedding.cu
   src/relu.cpp
   src/gelu.cpp
   src/swiglu.cpp

@@ -74,7 +74,7 @@ class Context {
 
 `Context` is neither copyable nor movable. The constructor creates the stream, the cuDNN handle, and the cuBLAS handle on the current device. Pass the same `Context&` to every tensor, label buffer, layer, and loss that must share that stream.
 
-`synchronize()` waits until work queued on that stream has finished. `Tensor::to_host()` and `kaiming_normal` synchronize for you. `copy_from_host` queues an async copy, so call `synchronize()` before reusing the host buffer.
+`synchronize()` waits until work queued on that stream has finished. `Tensor::to_host()`, `kaiming_normal`, and `normal_` synchronize for you. `copy_from_host` queues an async copy, so call `synchronize()` before reusing the host buffer.
 
 ## Tensor
 
@@ -131,6 +131,28 @@ class DeviceIndices {
 ```
 
 `DeviceIndices` is the label buffer for `softmax_cross_entropy`. It is movable and not copyable. `n` is the batch size and must be positive. `n <= 0` throws `empty labels`. Values are `int64` class indices on the device. `copy_from_host` requires `n == size()` and throws `label count mismatch` otherwise. The destructor synchronizes and frees the buffer.
+
+## IndexTensor
+
+Header: `nn/index_tensor.hpp`
+
+```cpp
+class IndexTensor {
+ public:
+  IndexTensor(Context& ctx, std::vector<int> shape);
+  void copy_from_host(const int64_t* src, int64_t n);
+  const int64_t* data() const;
+  const std::vector<int>& shape() const;
+  int64_t numel() const;
+  Context& context() const;
+};
+```
+
+`IndexTensor` is a dense `int64` index buffer for `Embedding`. It is movable and not copyable. It is not a float `Tensor`. `DeviceIndices` stays the rank-1 label buffer for `softmax_cross_entropy`.
+
+The shape has rank 1 `(N,)` or rank 2 `(N, T)`. Every dimension is at least 1. The element count must fit in a signed 32-bit integer. A bad rank throws `index tensor rank out of range`. A bad dimension throws `index tensor dimension out of range`. An overflowing product throws `index tensor numel out of range`.
+
+`data()` is a device pointer. `copy_from_host` queues an async copy and throws `index tensor host copy numel mismatch` when `n` differs from `numel()`. Call `context().synchronize()` before reusing the host buffer. The destructor synchronizes the stream and frees the device memory. Destroy the index tensor before its context.
 
 ## LossResult
 
@@ -223,6 +245,27 @@ y = x * W^T + b
 ```
 
 A rank other than 2, or a feature count other than `in_features`, throws `Linear input shape`. `backward` takes a gradient of shape `(N, out_features)`, returns `(N, in_features)`, and adds into `grad_weight` and `grad_bias`. A mismatched gradient throws `Linear backward shape`.
+
+### Embedding
+
+Header: `nn/layers/embedding.hpp`
+
+```cpp
+Embedding(Context& ctx, int num_embeddings, int embedding_dim, std::mt19937& rng);
+const Tensor& forward_indices(const IndexTensor& indices);
+```
+
+`num_embeddings` and `embedding_dim` are at least 1. A smaller value throws `Embedding size`. The constructor draws `weight` with `normal_` at mean 0 and standard deviation 0.02. There is no padding index. Pass an index tensor from the same context (`Embedding context`).
+
+| Tensor | Shape | Name |
+|---|---|---|
+| weight | `(num_embeddings, embedding_dim)` | `weight` |
+
+`forward(const Tensor&)` throws `Embedding requires indices`. Call `forward_indices` instead.
+
+`forward_indices` reads rank 1 `(N,)` or rank 2 `(N, T)` and returns `(N, embedding_dim)` or `(N, T, embedding_dim)`. It copies the ids and checks them on the host before the gather, which synchronizes. Each id must be in `[0, num_embeddings)`. An id outside that range throws `index out of range` and leaves the previous ids in place. The output row is `weight[id]`.
+
+`backward` takes a gradient of that output shape and scatter-adds it into `grad_weight`. Duplicate ids in one batch accumulate. `backward` does not clear `grad_weight`; call `zero_grad` first. A call without a successful `forward_indices` throws `Embedding backward without forward`. A mismatched gradient throws `Embedding backward shape`. Token ids are not differentiable, so the returned tensor has the same shape as `grad_output` and is filled with zeros. The reference is owned by the layer.
 
 ### ReLU
 
@@ -806,3 +849,13 @@ void kaiming_normal(Tensor& weight, int fan_in, std::mt19937& rng);
 ```
 
 Fills `weight` with a normal distribution of mean 0 and standard deviation `sqrt(2 / fan_in)`, then synchronizes. `fan_in` is at least 1 (`kaiming fan_in`). `Linear` uses `in_features`. `Conv2d` uses `in_channels * kernel * kernel`. `RNN` uses `input_size` for `weight_ih` and `hidden_size` for `weight_hh`. Builders call this for you. Call it when you construct a `Linear`, `Conv2d`, or `RNN` yourself and want to draw again into an existing weight tensor.
+
+## normal_
+
+Header: `nn/init.hpp`
+
+```cpp
+void normal_(Tensor& tensor, float mean, float std, std::mt19937& rng);
+```
+
+Fills `tensor` on the host from a normal distribution with the given mean and standard deviation, copies those values to the device, then synchronizes. `std` must be positive and finite (`normal_ std`). `mean` must be finite (`normal_ mean`). `Embedding` calls this with mean 0 and standard deviation 0.02. The standard deviation is an argument; it is not fixed inside `Embedding` alone.
