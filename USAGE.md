@@ -43,7 +43,7 @@ net.eval();
 net.save("mlp.bin", nullptr);
 ```
 
-Weight and bias gradients accumulate. Call `zero_grad` once per step. A new network is in train mode. Call `eval()` before inference when the network contains batch-norm.
+Weight and bias gradients accumulate. Call `zero_grad` once per step. A new network is in train mode. Call `eval()` before inference when the network contains batch-norm or dropout.
 
 For an image network, `input` is rank 4: `(N, in_channels, in_height, in_width)`. For a recurrent network, `input` is rank 3: `(N, T, input_size)`. `build_rnn` returns logits of shape `(N, output_size)`.
 
@@ -197,7 +197,7 @@ class Layer {
 };
 ```
 
-`Layer` is the abstract base. Construct a concrete layer with a `Context`, then call `forward` and `backward` yourself or hand ownership to a `Network` with `std::unique_ptr<Layer>`. `set_name` before the network is built. `buffers()` defaults to an empty list. `set_training` defaults to a no-op. `BatchNorm2d` and `ResidualBlock` honor it.
+`Layer` is the abstract base. Construct a concrete layer with a `Context`, then call `forward` and `backward` yourself or hand ownership to a `Network` with `std::unique_ptr<Layer>`. `set_name` before the network is built. `buffers()` defaults to an empty list. `set_training` defaults to a no-op. `BatchNorm2d`, `Dropout`, and `ResidualBlock` honor it. `LayerNorm` ignores it: train and eval use the same math.
 
 `backward` reads the activation saved by the matching `forward`. Call `forward` on that layer before `backward`.
 
@@ -368,6 +368,42 @@ In train mode the layer requires `N * H * W > 1`. A smaller count throws `BatchN
 `backward` runs in train mode and adds into the scale and shift gradients. Eval mode throws `BatchNorm backward requires train mode`. A missing forward or a mismatched gradient throws `BatchNorm2d backward shape`.
 
 `set_training(true)` selects train mode. `set_training(false)` selects eval mode. `Network::train` and `Network::eval` call `set_training` on every layer.
+
+### LayerNorm
+
+Header: `nn/layers/layer_norm.hpp`
+
+```cpp
+LayerNorm(Context& ctx, int normalized_shape, float eps = 1e-5f);
+```
+
+`normalized_shape` is at least 1 (`LayerNorm size`). `eps` is finite and greater than 0 (`LayerNorm eps`). The default is `1e-5`.
+
+`weight` (gamma) has shape `(normalized_shape)` and starts at 1. `bias` (beta) has the same shape and starts at 0. Names are `weight` and `bias`. There are no buffers. `set_training` does not change the result.
+
+`forward` accepts rank 2 `(N, normalized_shape)` or rank 3 `(N, T, normalized_shape)` and returns the same shape. Mean and variance are over the last dimension. Variance is the mean of squared deviations, divided by `normalized_shape`, not `normalized_shape - 1`:
+
+```
+y = (x - mean) / sqrt(var + eps) * weight + bias
+```
+
+A rank other than 2 or 3, or a last dimension other than `normalized_shape`, throws `LayerNorm input shape`. `backward` returns the input shape and adds into `grad_weight` and `grad_bias`. A missing forward or a mismatched gradient throws `LayerNorm backward shape`.
+
+### Dropout
+
+Header: `nn/layers/dropout.hpp`
+
+```cpp
+Dropout(Context& ctx, float p);
+```
+
+`p` is in `[0, 1)`. Any other value, including NaN, throws `Dropout p`. The layer owns an `std::mt19937` seeded from `std::random_device`. There is no seed setter. There are no parameters and no buffers.
+
+`set_training(true)` is train mode, which is the default. `set_training(false)` is eval mode. `p == 0` is the identity in both modes. Eval mode is the identity for every legal `p`.
+
+In train mode with `p > 0` the layer draws an inverted-dropout mask on the host and uploads it. A kept element is multiplied by `1 / (1 - p)`. A dropped element is 0. `backward` multiplies by that same mask. Each train `forward` draws a new mask.
+
+`forward` accepts any rank a tensor can store and returns the same shape. A backward with no forward, or a gradient whose shape differs from the forward output, throws `Dropout backward shape`.
 
 ### Flatten
 

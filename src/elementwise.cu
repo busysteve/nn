@@ -33,6 +33,11 @@ __global__ void add2_kernel(float* dst, const float* a, const float* b, int64_t 
   if (i < n) dst[i] = a[i] + b[i];
 }
 
+__global__ void mul_kernel(float* y, const float* a, const float* b, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = a[i] * b[i];
+}
+
 __device__ float gelu_forward(float x) {
   constexpr float kInvSqrt2 = 0.7071067811865476f;
   return 0.5f * x * (1.f + erff(x * kInvSqrt2));
@@ -154,6 +159,12 @@ void launch_add2(cudaStream_t stream, float* dst, const float* a, const float* b
   if (n <= 0) return;
   add2_kernel<<<blocks_for(n), 256, 0, stream>>>(dst, a, b, n);
   check_cuda(cudaGetLastError(), "add2");
+}
+
+void launch_mul(cudaStream_t stream, float* y, const float* a, const float* b, int64_t n) {
+  if (n <= 0) return;
+  mul_kernel<<<blocks_for(n), 256, 0, stream>>>(y, a, b, n);
+  check_cuda(cudaGetLastError(), "mul");
 }
 
 void launch_gelu(cudaStream_t stream, float* y, const float* x, int64_t n) {

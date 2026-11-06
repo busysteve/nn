@@ -2,8 +2,10 @@
 
 #include "nn/layers/batch_norm2d.hpp"
 #include "nn/layers/conv2d.hpp"
+#include "nn/layers/dropout.hpp"
 #include "nn/layers/gelu.hpp"
 #include "nn/layers/last_step.hpp"
+#include "nn/layers/layer_norm.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/max_pool2d.hpp"
 #include "nn/layers/relu.hpp"
@@ -199,6 +201,59 @@ int test_gradients() {
     nn::GELU layer(ctx);
     nn::Tensor input(ctx, {2, 3, 4});
     input.copy_from_host(uniform(input.numel(), rng, -0.8f, 0.8f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad layernorm\n");
+  {
+    nn::LayerNorm layer(ctx, 5);
+    nn::Tensor input(ctx, {4, 5});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad layernorm rank3\n");
+  {
+    nn::LayerNorm layer(ctx, 4);
+    std::vector<nn::NamedParam> params = layer.parameters();
+    params[0].value->copy_from_host(std::vector<float>{0.5f, -1.f, 1.5f, 0.25f});
+    params[1].value->copy_from_host(std::vector<float>{0.1f, -0.2f, 0.3f, -0.4f});
+    nn::Tensor input(ctx, {2, 3, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad dropout p0\n");
+  {
+    nn::Dropout layer(ctx, 0.f);
+    nn::Tensor input(ctx, {4, 5});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad dropout p0 rank3\n");
+  {
+    nn::Dropout layer(ctx, 0.f);
+    nn::Tensor input(ctx, {2, 3, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad dropout eval\n");
+  {
+    nn::Dropout layer(ctx, 0.5f);
+    layer.set_training(false);
+    nn::Tensor input(ctx, {4, 5});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad dropout eval rank3\n");
+  {
+    nn::Dropout layer(ctx, 0.4f);
+    layer.set_training(false);
+    nn::Tensor input(ctx, {2, 3, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
     check_layer(layer, input);
   }
 

@@ -4,8 +4,10 @@
 #include "nn/conv_resnet.hpp"
 #include "nn/error.hpp"
 #include "nn/layers/conv2d.hpp"
+#include "nn/layers/dropout.hpp"
 #include "nn/layers/gelu.hpp"
 #include "nn/layers/last_step.hpp"
+#include "nn/layers/layer_norm.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
@@ -16,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -116,6 +119,68 @@ float gelu_ref(float x) {
 float silu_ref(float x) {
   const float sigmoid = (x >= 0.f) ? 1.f / (1.f + std::exp(-x)) : std::exp(x) / (1.f + std::exp(x));
   return x * sigmoid;
+}
+
+struct LayerNormRef {
+  std::vector<float> y;
+  std::vector<float> dx;
+  std::vector<float> dgamma;
+  std::vector<float> dbeta;
+};
+
+LayerNormRef layer_norm_ref(const std::vector<float>& x, const std::vector<float>& gamma,
+                            const std::vector<float>& beta, const std::vector<float>& dy, int rows,
+                            int cols, float eps) {
+  LayerNormRef ref;
+  ref.y.resize(x.size());
+  ref.dx.resize(x.size());
+  ref.dgamma.assign(static_cast<size_t>(cols), 0.f);
+  ref.dbeta.assign(static_cast<size_t>(cols), 0.f);
+  std::vector<double> dgamma(static_cast<size_t>(cols), 0.0);
+  std::vector<double> dbeta(static_cast<size_t>(cols), 0.0);
+  for (int row = 0; row < rows; ++row) {
+    const size_t base = static_cast<size_t>(row) * static_cast<size_t>(cols);
+    double mean = 0.0;
+    for (int col = 0; col < cols; ++col) mean += static_cast<double>(x[base + static_cast<size_t>(col)]);
+    mean /= static_cast<double>(cols);
+    double var = 0.0;
+    for (int col = 0; col < cols; ++col) {
+      const double diff = static_cast<double>(x[base + static_cast<size_t>(col)]) - mean;
+      var += diff * diff;
+    }
+    var /= static_cast<double>(cols);
+    const double inv = 1.0 / std::sqrt(var + static_cast<double>(eps));
+    double sum_dhat = 0.0;
+    double sum_dhat_xhat = 0.0;
+    std::vector<double> xhat(static_cast<size_t>(cols));
+    std::vector<double> dhat(static_cast<size_t>(cols));
+    for (int col = 0; col < cols; ++col) {
+      xhat[static_cast<size_t>(col)] =
+          (static_cast<double>(x[base + static_cast<size_t>(col)]) - mean) * inv;
+      ref.y[base + static_cast<size_t>(col)] = static_cast<float>(
+          xhat[static_cast<size_t>(col)] * static_cast<double>(gamma[static_cast<size_t>(col)]) +
+          static_cast<double>(beta[static_cast<size_t>(col)]));
+      dhat[static_cast<size_t>(col)] = static_cast<double>(dy[base + static_cast<size_t>(col)]) *
+                                       static_cast<double>(gamma[static_cast<size_t>(col)]);
+      sum_dhat += dhat[static_cast<size_t>(col)];
+      sum_dhat_xhat += dhat[static_cast<size_t>(col)] * xhat[static_cast<size_t>(col)];
+    }
+    const double mean_dhat = sum_dhat / static_cast<double>(cols);
+    const double mean_dhat_xhat = sum_dhat_xhat / static_cast<double>(cols);
+    for (int col = 0; col < cols; ++col) {
+      ref.dx[base + static_cast<size_t>(col)] = static_cast<float>(
+          inv * (dhat[static_cast<size_t>(col)] - mean_dhat -
+                 xhat[static_cast<size_t>(col)] * mean_dhat_xhat));
+      dgamma[static_cast<size_t>(col)] +=
+          static_cast<double>(dy[base + static_cast<size_t>(col)]) * xhat[static_cast<size_t>(col)];
+      dbeta[static_cast<size_t>(col)] += static_cast<double>(dy[base + static_cast<size_t>(col)]);
+    }
+  }
+  for (int col = 0; col < cols; ++col) {
+    ref.dgamma[static_cast<size_t>(col)] = static_cast<float>(dgamma[static_cast<size_t>(col)]);
+    ref.dbeta[static_cast<size_t>(col)] = static_cast<float>(dbeta[static_cast<size_t>(col)]);
+  }
+  return ref;
 }
 
 std::vector<float> swiglu_ref(const std::vector<float>& input, int rows, int inner) {
@@ -349,6 +414,181 @@ int test_shapes() {
     CHECK(layer.forward(rank4).shape() == rank4.shape());
     nn::Tensor bad_rank(ctx, {6});
     expect_error([&] { layer.forward(bad_rank); }, "ReLU rank");
+  }
+
+  {
+    expect_error([&] { nn::LayerNorm bad(ctx, 0); }, "LayerNorm size");
+    expect_error([&] { nn::LayerNorm bad(ctx, -1); }, "LayerNorm size");
+    expect_error([&] { nn::LayerNorm bad(ctx, 2, 0.f); }, "LayerNorm eps");
+    expect_error([&] { nn::LayerNorm bad(ctx, 2, -1.f); }, "LayerNorm eps");
+    expect_error([&] { nn::LayerNorm bad(ctx, 2, std::nanf("")); }, "LayerNorm eps");
+    expect_error(
+        [&] { nn::LayerNorm bad(ctx, 2, std::numeric_limits<float>::infinity()); }, "LayerNorm eps");
+
+    constexpr float eps = 1e-3f;
+    nn::LayerNorm layer(ctx, 3, eps);
+    std::vector<nn::NamedParam> params = layer.parameters();
+    CHECK(params.size() == 2);
+    CHECK(params[0].name == "weight");
+    CHECK(params[1].name == "bias");
+    CHECK(params[0].value->shape() == std::vector<int>({3}));
+    CHECK(params[1].value->shape() == std::vector<int>({3}));
+    CHECK(layer.buffers().empty());
+    expect_close(params[0].value->to_host(), {1.f, 1.f, 1.f}, "ln-gamma-init");
+    expect_close(params[1].value->to_host(), {0.f, 0.f, 0.f}, "ln-beta-init");
+    const std::vector<float> gamma = {1.f, 0.5f, -2.f};
+    const std::vector<float> beta = {0.25f, -0.5f, 1.f};
+    params[0].value->copy_from_host(gamma);
+    params[1].value->copy_from_host(beta);
+
+    const std::vector<float> host = {1.f, 2.f, 3.f, 4.f, 4.f, 4.f, -1.f, 0.f, 2.f};
+    const std::vector<float> dy = {1.f, -1.f, 0.5f, 1.f, 1.f, 1.f, 0.f, 2.f, -1.f};
+    nn::Tensor input(ctx, {3, 3});
+    input.copy_from_host(host);
+    const LayerNormRef ref = layer_norm_ref(host, gamma, beta, dy, 3, 3, eps);
+    expect_close(layer.forward(input).to_host(), ref.y, "layernorm");
+    layer.set_training(false);
+    expect_close(layer.forward(input).to_host(), ref.y, "layernorm-eval");
+    layer.set_training(true);
+    expect_close(layer.forward(input).to_host(), ref.y, "layernorm-train");
+
+    layer.zero_grad();
+    nn::Tensor grad(ctx, input.shape());
+    grad.copy_from_host(dy);
+    expect_close(layer.backward(grad).to_host(), ref.dx, "layernorm-dx");
+    expect_close(params[0].grad->to_host(), ref.dgamma, "layernorm-dw");
+    expect_close(params[1].grad->to_host(), ref.dbeta, "layernorm-db");
+    const std::vector<float> once_w = params[0].grad->to_host();
+    const std::vector<float> once_b = params[1].grad->to_host();
+    layer.backward(grad);
+    std::vector<float> twice_w(once_w.size());
+    std::vector<float> twice_b(once_b.size());
+    for (size_t i = 0; i < once_w.size(); ++i) {
+      twice_w[i] = once_w[i] + once_w[i];
+      twice_b[i] = once_b[i] + once_b[i];
+    }
+    expect_close(params[0].grad->to_host(), twice_w, "layernorm-dw-accum");
+    expect_close(params[1].grad->to_host(), twice_b, "layernorm-db-accum");
+
+    const std::vector<float> seq = {1.f, 2.f, 3.f, 0.f, 1.f, -1.f, 4.f, 4.f, 4.f, -2.f, 0.5f, 1.5f};
+    const std::vector<float> dy3 = {0.5f, -0.5f, 1.f, 1.f, 0.f, -1.f, 0.25f, 0.25f, 0.25f, 1.f, -2.f, 0.5f};
+    nn::Tensor rank3(ctx, {2, 2, 3});
+    rank3.copy_from_host(seq);
+    const LayerNormRef ref3 = layer_norm_ref(seq, gamma, beta, dy3, 4, 3, eps);
+    CHECK(layer.forward(rank3).shape() == rank3.shape());
+    expect_close(layer.forward(rank3).to_host(), ref3.y, "layernorm-rank3");
+    layer.zero_grad();
+    nn::Tensor grad3(ctx, rank3.shape());
+    grad3.copy_from_host(dy3);
+    const nn::Tensor& dx3 = layer.backward(grad3);
+    CHECK(dx3.shape() == rank3.shape());
+    expect_close(dx3.to_host(), ref3.dx, "layernorm-rank3-dx");
+    expect_close(params[0].grad->to_host(), ref3.dgamma, "layernorm-rank3-dw");
+    expect_close(params[1].grad->to_host(), ref3.dbeta, "layernorm-rank3-db");
+
+    nn::LayerNorm defaults(ctx, 3);
+    nn::LayerNorm explicit_eps(ctx, 3, 1e-5f);
+    nn::Tensor probe(ctx, {2, 3});
+    probe.copy_from_host(std::vector<float>{1.f, 2.f, 4.f, -1.f, 0.5f, 0.25f});
+    const std::vector<float> default_y = defaults.forward(probe).to_host();
+    const std::vector<float> explicit_y = explicit_eps.forward(probe).to_host();
+    expect_close(default_y, explicit_y, "layernorm-default-eps");
+
+    nn::Tensor bad_rank(ctx, {3});
+    expect_error([&] { layer.forward(bad_rank); }, "LayerNorm input shape");
+    nn::Tensor bad_rank4(ctx, {1, 1, 1, 3});
+    expect_error([&] { layer.forward(bad_rank4); }, "LayerNorm input shape");
+    nn::Tensor bad_last(ctx, {2, 2, 4});
+    expect_error([&] { layer.forward(bad_last); }, "LayerNorm input shape");
+    nn::Tensor bad_grad(ctx, {2, 3});
+    expect_error([&] { layer.backward(bad_grad); }, "LayerNorm backward shape");
+    nn::LayerNorm fresh(ctx, 3);
+    expect_error([&] { fresh.backward(grad); }, "LayerNorm backward shape");
+  }
+
+  {
+    expect_error([&] { nn::Dropout bad(ctx, 1.f); }, "Dropout p");
+    expect_error([&] { nn::Dropout bad(ctx, -0.1f); }, "Dropout p");
+    expect_error([&] { nn::Dropout bad(ctx, std::nanf("")); }, "Dropout p");
+
+    nn::Dropout identity(ctx, 0.f);
+    CHECK(identity.parameters().empty());
+    CHECK(identity.buffers().empty());
+    const std::vector<float> host = {1.f, -1.f, 0.5f, 2.f, -3.f, 4.f};
+    nn::Tensor input(ctx, {2, 3});
+    input.copy_from_host(host);
+    expect_close(identity.forward(input).to_host(), host, "dropout-p0");
+    nn::Tensor grad(ctx, input.shape());
+    const std::vector<float> dy = {0.25f, 0.5f, -1.f, 1.5f, 2.f, -0.5f};
+    grad.copy_from_host(dy);
+    expect_close(identity.backward(grad).to_host(), dy, "dropout-p0-grad");
+
+    nn::Tensor rank3(ctx, {2, 2, 3});
+    rank3.copy_from_host(std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f, -1.f, -2.f, 0.5f, 0.25f, 8.f, -4.f});
+    const std::vector<float> rank3_host = rank3.to_host();
+    expect_close(identity.forward(rank3).to_host(), rank3_host, "dropout-p0-rank3");
+    nn::Tensor grad3(ctx, rank3.shape());
+    grad3.fill(1.25f);
+    expect_close(identity.backward(grad3).to_host(),
+                 std::vector<float>(static_cast<size_t>(rank3.numel()), 1.25f), "dropout-p0-rank3-grad");
+
+    nn::Dropout layer(ctx, 0.5f);
+    layer.set_training(false);
+    expect_close(layer.forward(input).to_host(), host, "dropout-eval");
+    expect_close(layer.backward(grad).to_host(), dy, "dropout-eval-grad");
+    nn::Tensor eval_rank3(ctx, rank3.shape());
+    eval_rank3.copy_from_host(rank3_host);
+    CHECK(layer.forward(eval_rank3).shape() == eval_rank3.shape());
+    expect_close(layer.forward(eval_rank3).to_host(), rank3_host, "dropout-eval-rank3");
+
+    layer.set_training(true);
+    std::vector<float> varied(128);
+    for (size_t i = 0; i < varied.size(); ++i) {
+      varied[i] = 0.25f * static_cast<float>(static_cast<int>(i) - 64);
+    }
+    nn::Tensor train_input(ctx, {4, 32});
+    train_input.copy_from_host(varied);
+    const std::vector<float> dropped = layer.forward(train_input).to_host();
+    nn::Tensor train_grad(ctx, train_input.shape());
+    train_grad.fill(1.f);
+    const std::vector<float> dx = layer.backward(train_grad).to_host();
+    const std::vector<float> dx_again = layer.backward(train_grad).to_host();
+    CHECK(dx == dx_again);
+    constexpr float scale = 2.f;
+    int kept = 0;
+    int dropped_n = 0;
+    CHECK(dropped.size() == varied.size());
+    CHECK(dx.size() == varied.size());
+    for (size_t i = 0; i < varied.size(); ++i) {
+      const bool is_dropped = dx[i] == 0.f;
+      const bool is_kept = dx[i] == scale;
+      CHECK(is_dropped || is_kept);
+      if (is_dropped) {
+        CHECK(dropped[i] == 0.f);
+        ++dropped_n;
+      }
+      if (is_kept) {
+        CHECK(dropped[i] == varied[i] * scale);
+        ++kept;
+      }
+    }
+    CHECK(kept > 0);
+    CHECK(dropped_n > 0);
+
+    layer.set_training(false);
+    expect_close(layer.forward(train_input).to_host(), varied, "dropout-eval-after-train");
+    train_grad.fill(1.5f);
+    expect_close(layer.backward(train_grad).to_host(),
+                 std::vector<float>(varied.size(), 1.5f), "dropout-eval-after-train-grad");
+
+    nn::Dropout fresh(ctx, 0.f);
+    nn::Tensor missing(ctx, {1, 2});
+    expect_error([&] { fresh.backward(missing); }, "Dropout backward shape");
+    nn::Tensor tiny(ctx, {1, 2});
+    tiny.fill(1.f);
+    fresh.forward(tiny);
+    nn::Tensor bad_grad(ctx, {2, 2});
+    expect_error([&] { fresh.backward(bad_grad); }, "Dropout backward shape");
   }
 
   {
