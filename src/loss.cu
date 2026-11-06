@@ -257,7 +257,12 @@ LossResult sequence_cross_entropy(Context& ctx, const Tensor& logits, const Inde
     cudaFree(counts);
     check_cuda(count_launch, "sequence_cross_entropy");
   }
-  ctx.synchronize();
+  // synchronize() throws through check_cuda. per_sample is still null here.
+  const cudaError_t count_sync = cudaStreamSynchronize(stream);
+  if (count_sync != cudaSuccess) {
+    cudaFree(counts);
+    check_cuda(count_sync, "cudaStreamSynchronize");
+  }
   int bad_host = 0;
   int n_valid = 0;
   const cudaError_t copy_bad = cudaMemcpy(&bad_host, bad, sizeof(int), cudaMemcpyDeviceToHost);
@@ -295,9 +300,21 @@ LossResult sequence_cross_entropy(Context& ctx, const Tensor& logits, const Inde
     check_cuda(launch, "sequence_cross_entropy");
   }
 
-  thrust::device_ptr<float> begin(per_sample);
-  const float sum = thrust::reduce(thrust::cuda::par.on(stream), begin, begin + rows, 0.f);
-  ctx.synchronize();
+  float sum = 0.f;
+  try {
+    thrust::device_ptr<float> begin(per_sample);
+    sum = thrust::reduce(thrust::cuda::par.on(stream), begin, begin + rows, 0.f);
+  } catch (...) {
+    cudaFree(per_sample);
+    cudaFree(counts);
+    throw;
+  }
+  const cudaError_t loss_sync = cudaStreamSynchronize(stream);
+  if (loss_sync != cudaSuccess) {
+    cudaFree(per_sample);
+    cudaFree(counts);
+    check_cuda(loss_sync, "cudaStreamSynchronize");
+  }
   const cudaError_t copy = cudaMemcpy(&bad_host, bad, sizeof(int), cudaMemcpyDeviceToHost);
   cudaFree(per_sample);
   cudaFree(counts);
