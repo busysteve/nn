@@ -38,6 +38,7 @@ add_library(nn STATIC
   src/swiglu.cpp
   src/layer_norm.cu
   src/dropout.cpp
+  src/multi_head_attention.cu
   src/rnn.cpp
   src/last_step.cpp
   src/conv2d.cpp

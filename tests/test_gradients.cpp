@@ -8,6 +8,7 @@
 #include "nn/layers/layer_norm.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/max_pool2d.hpp"
+#include "nn/layers/multi_head_attention.hpp"
 #include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
 #include "nn/layers/rnn.hpp"
@@ -339,6 +340,30 @@ int test_gradients() {
     condition_bn(layer);
     nn::Tensor input(ctx, {2, 2, 6, 6});
     input.copy_from_host(uniform(input.numel(), rng, 0.2f, 0.8f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad mha causal\n");
+  {
+    nn::MultiHeadAttention layer(ctx, 4, 2, true, true, false, rng);
+    nn::Tensor input(ctx, {1, 3, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad mha causal no bias\n");
+  {
+    nn::MultiHeadAttention layer(ctx, 4, 2, true, false, false, rng);
+    nn::Tensor input(ctx, {1, 3, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad mha no causal\n");
+  {
+    nn::MultiHeadAttention layer(ctx, 4, 2, false, false, false, rng);
+    nn::Tensor input(ctx, {1, 3, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
     check_layer(layer, input);
   }
 

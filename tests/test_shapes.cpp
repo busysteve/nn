@@ -9,11 +9,13 @@
 #include "nn/layers/last_step.hpp"
 #include "nn/layers/layer_norm.hpp"
 #include "nn/layers/linear.hpp"
+#include "nn/layers/multi_head_attention.hpp"
 #include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
 #include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -215,6 +217,243 @@ void check_block(nn::Context& ctx, int in_channels, int out_channels, int stride
     if (param.name == "proj.weight") found = true;
   }
   CHECK(found == expect_proj);
+}
+
+std::vector<float> linear_ref(const std::vector<float>& x, int rows, int in_f, int out_f,
+                              const std::vector<float>& weight, const std::vector<float>* bias) {
+  std::vector<float> y(static_cast<size_t>(rows) * static_cast<size_t>(out_f));
+  for (int r = 0; r < rows; ++r) {
+    for (int o = 0; o < out_f; ++o) {
+      double acc = bias == nullptr ? 0.0 : static_cast<double>((*bias)[static_cast<size_t>(o)]);
+      for (int c = 0; c < in_f; ++c) {
+        acc += static_cast<double>(x[static_cast<size_t>(r * in_f + c)]) *
+               static_cast<double>(weight[static_cast<size_t>(o * in_f + c)]);
+      }
+      y[static_cast<size_t>(r * out_f + o)] = static_cast<float>(acc);
+    }
+  }
+  return y;
+}
+
+std::vector<float> mha_ref(const std::vector<float>& x, int n, int time, int d_model, int heads,
+                           bool causal, const std::vector<float>& wq, const std::vector<float>* bq,
+                           const std::vector<float>& wk, const std::vector<float>* bk,
+                           const std::vector<float>& wv, const std::vector<float>* bv,
+                           const std::vector<float>& wo, const std::vector<float>* bo) {
+  const int dh = d_model / heads;
+  const int rows = n * time;
+  const std::vector<float> q = linear_ref(x, rows, d_model, d_model, wq, bq);
+  const std::vector<float> k = linear_ref(x, rows, d_model, d_model, wk, bk);
+  const std::vector<float> v = linear_ref(x, rows, d_model, d_model, wv, bv);
+  const double scale = 1.0 / std::sqrt(static_cast<double>(dh));
+  const double mask = static_cast<double>(-1.0e9f);
+  std::vector<float> mixed(static_cast<size_t>(rows) * static_cast<size_t>(d_model), 0.f);
+  for (int batch = 0; batch < n; ++batch) {
+    for (int h = 0; h < heads; ++h) {
+      std::vector<double> scores(static_cast<size_t>(time * time));
+      for (int i = 0; i < time; ++i) {
+        for (int j = 0; j < time; ++j) {
+          double dot = 0.0;
+          for (int e = 0; e < dh; ++e) {
+            const size_t q_i = static_cast<size_t>((((batch * time + i) * heads + h) * dh) + e);
+            const size_t k_i = static_cast<size_t>((((batch * time + j) * heads + h) * dh) + e);
+            dot += static_cast<double>(q[q_i]) * static_cast<double>(k[k_i]);
+          }
+          double value = dot * scale;
+          if (causal && j > i) value = mask;
+          scores[static_cast<size_t>(i * time + j)] = value;
+        }
+      }
+      for (int i = 0; i < time; ++i) {
+        double max_s = scores[static_cast<size_t>(i * time)];
+        for (int j = 1; j < time; ++j) {
+          max_s = std::max(max_s, scores[static_cast<size_t>(i * time + j)]);
+        }
+        double sum = 0.0;
+        for (int j = 0; j < time; ++j) {
+          sum += std::exp(scores[static_cast<size_t>(i * time + j)] - max_s);
+        }
+        for (int e = 0; e < dh; ++e) {
+          double acc = 0.0;
+          for (int j = 0; j < time; ++j) {
+            const double prob = std::exp(scores[static_cast<size_t>(i * time + j)] - max_s) / sum;
+            const size_t v_i = static_cast<size_t>((((batch * time + j) * heads + h) * dh) + e);
+            acc += prob * static_cast<double>(v[v_i]);
+          }
+          mixed[static_cast<size_t>((((batch * time + i) * heads + h) * dh) + e)] =
+              static_cast<float>(acc);
+        }
+      }
+    }
+  }
+  return linear_ref(mixed, rows, d_model, d_model, wo, bo);
+}
+
+std::vector<float> host_param(const nn::Layer& layer, const std::string& name) {
+  for (const nn::NamedParam& param : layer.parameters()) {
+    if (param.name == name) return param.value->to_host();
+  }
+  CHECK(false);
+  return {};
+}
+
+const std::vector<float>* bias_of(const nn::Layer& layer, const std::string& name,
+                                  std::vector<float>& storage) {
+  for (const nn::NamedParam& param : layer.parameters()) {
+    if (param.name == name) {
+      storage = param.value->to_host();
+      return &storage;
+    }
+  }
+  return nullptr;
+}
+
+void set_param(nn::Layer& layer, const std::string& name, const std::vector<float>& values) {
+  for (nn::NamedParam param : layer.parameters()) {
+    if (param.name == name) {
+      param.value->copy_from_host(values);
+      return;
+    }
+  }
+  CHECK(false);
+}
+
+void expect_mha_matches(nn::MultiHeadAttention& layer, const nn::Tensor& input, int n, int time,
+                        int d_model, int heads, bool causal, const char* name) {
+  std::vector<float> bq;
+  std::vector<float> bk;
+  std::vector<float> bv;
+  std::vector<float> bo;
+  const std::vector<float> want = mha_ref(
+      input.to_host(), n, time, d_model, heads, causal, host_param(layer, "q.weight"),
+      bias_of(layer, "q.bias", bq), host_param(layer, "k.weight"), bias_of(layer, "k.bias", bk),
+      host_param(layer, "v.weight"), bias_of(layer, "v.bias", bv), host_param(layer, "out.weight"),
+      bias_of(layer, "out.bias", bo));
+  const nn::Tensor& output = layer.forward(input);
+  CHECK(output.shape() == std::vector<int>({n, time, d_model}));
+  expect_close(output.to_host(), want, name);
+}
+
+std::vector<float> eye(int d) {
+  std::vector<float> weight(static_cast<size_t>(d * d), 0.f);
+  for (int i = 0; i < d; ++i) weight[static_cast<size_t>(i * d + i)] = 1.f;
+  return weight;
+}
+
+void check_multi_head_attention(nn::Context& ctx, std::mt19937& rng) {
+  expect_invalid([&] { nn::MultiHeadAttention(ctx, 4, 2, true, false, true, rng); }, "use_rope");
+  expect_error([&] { nn::MultiHeadAttention(ctx, 4, 3, true, false, false, rng); },
+               "MultiHeadAttention size");
+  expect_error([&] { nn::MultiHeadAttention(ctx, 4, 0, true, false, false, rng); },
+               "MultiHeadAttention size");
+  expect_error([&] { nn::MultiHeadAttention(ctx, 0, 1, false, false, false, rng); },
+               "MultiHeadAttention size");
+  expect_error([&] { nn::MultiHeadAttention(ctx, -2, 1, false, true, false, rng); },
+               "MultiHeadAttention size");
+
+  {
+    nn::MultiHeadAttention layer(ctx, 4, 2, true, true, false, rng);
+    const std::vector<nn::NamedParam> params = layer.parameters();
+    const std::vector<std::string> names = {"q.weight", "q.bias", "k.weight", "k.bias",
+                                            "v.weight", "v.bias", "out.weight", "out.bias"};
+    CHECK(params.size() == names.size());
+    for (size_t i = 0; i < names.size(); ++i) {
+      CHECK(params[i].name == names[i]);
+      if (names[i].find("weight") != std::string::npos) {
+        CHECK(params[i].value->shape() == std::vector<int>({4, 4}));
+      } else {
+        CHECK(params[i].value->shape() == std::vector<int>({4}));
+      }
+    }
+    nn::Tensor input(ctx, {2, 3, 4});
+    input.copy_from_host(std::vector<float>{
+        0.2f, -0.4f, 0.1f, 0.3f,  -0.2f, 0.5f,  0.0f,  -0.1f, 0.4f, 0.2f, -0.3f, 0.1f,
+        0.1f, 0.0f,  -0.2f, 0.4f, 0.3f,  -0.1f, 0.2f, 0.0f,  -0.4f, 0.2f, 0.1f,  -0.3f});
+    set_param(layer, "q.bias", {0.2f, -0.1f, 0.05f, 0.3f});
+    set_param(layer, "k.bias", {0.1f, 0.0f, -0.2f, 0.4f});
+    set_param(layer, "v.bias", {-0.3f, 0.2f, 0.1f, -0.1f});
+    set_param(layer, "out.bias", {0.05f, -0.05f, 0.15f, -0.25f});
+    expect_mha_matches(layer, input, 2, 3, 4, 2, true, "mha-causal-bias");
+    nn::Tensor grad(ctx, input.shape());
+    grad.fill(1.f);
+    const std::vector<float> grad_before = grad.to_host();
+    CHECK(layer.backward(grad).shape() == input.shape());
+    CHECK(grad.to_host() == grad_before);
+    bool nonzero = false;
+    for (float value : params[0].grad->to_host()) {
+      if (value != 0.f) nonzero = true;
+    }
+    CHECK(nonzero);
+    layer.zero_grad();
+    for (const nn::NamedParam& param : layer.parameters()) {
+      for (float value : param.grad->to_host()) CHECK(value == 0.f);
+    }
+  }
+
+  {
+    nn::MultiHeadAttention layer(ctx, 4, 2, false, false, false, rng);
+    const std::vector<nn::NamedParam> params = layer.parameters();
+    CHECK(params.size() == 4);
+    CHECK(params[0].name == "q.weight");
+    CHECK(params[1].name == "k.weight");
+    CHECK(params[2].name == "v.weight");
+    CHECK(params[3].name == "out.weight");
+    nn::Tensor input(ctx, {2, 3, 4});
+    input.copy_from_host(std::vector<float>{
+        0.2f, -0.4f, 0.1f, 0.3f,  -0.2f, 0.5f,  0.0f,  -0.1f, 0.4f, 0.2f, -0.3f, 0.1f,
+        0.1f, 0.0f,  -0.2f, 0.4f, 0.3f,  -0.1f, 0.2f, 0.0f,  -0.4f, 0.2f, 0.1f,  -0.3f});
+    expect_mha_matches(layer, input, 2, 3, 4, 2, false, "mha-plain");
+    nn::Tensor bad_rank(ctx, {2, 4});
+    expect_error([&] { layer.forward(bad_rank); }, "MultiHeadAttention input shape");
+    nn::Tensor bad_last(ctx, {2, 3, 3});
+    expect_error([&] { layer.forward(bad_last); }, "MultiHeadAttention input shape");
+    nn::Tensor rank4(ctx, {1, 1, 3, 4});
+    expect_error([&] { layer.forward(rank4); }, "MultiHeadAttention input shape");
+    layer.forward(input);
+    nn::Tensor bad_grad(ctx, {2, 2, 4});
+    expect_error([&] { layer.backward(bad_grad); }, "MultiHeadAttention backward shape");
+  }
+
+  {
+    nn::MultiHeadAttention fresh(ctx, 4, 2, true, false, false, rng);
+    nn::Tensor grad(ctx, {1, 2, 4});
+    expect_error([&] { fresh.backward(grad); }, "MultiHeadAttention backward shape");
+  }
+
+  // H = 1 and V = W_out = I make the output the post-softmax matrix when the input is I.
+  {
+    constexpr int d = 3;
+    const std::vector<float> ident = eye(d);
+    nn::MultiHeadAttention causal(ctx, d, 1, true, false, false, rng);
+    for (const char* name : {"q.weight", "k.weight", "v.weight", "out.weight"}) {
+      set_param(causal, name, ident);
+    }
+    nn::Tensor input(ctx, {1, d, d});
+    input.copy_from_host(ident);
+    expect_mha_matches(causal, input, 1, d, d, 1, true, "mha-causal-eye");
+    const std::vector<float> y = causal.forward(input).to_host();
+    CHECK(std::fabs(y[0] - 1.f) <= 1e-5f);
+    for (int i = 0; i < d; ++i) {
+      for (int j = i + 1; j < d; ++j) CHECK(std::fabs(y[static_cast<size_t>(i * d + j)]) <= 1e-5f);
+    }
+    CHECK(std::fabs(y[3]) > 1e-3f);
+
+    nn::MultiHeadAttention plain(ctx, d, 1, false, false, false, rng);
+    for (const char* name : {"q.weight", "k.weight", "v.weight", "out.weight"}) {
+      set_param(plain, name, ident);
+    }
+    expect_mha_matches(plain, input, 1, d, d, 1, false, "mha-plain-eye");
+    const std::vector<float> open = plain.forward(input).to_host();
+    CHECK(std::fabs(open[1]) > 1e-3f);
+  }
+
+  {
+    nn::MultiHeadAttention layer(ctx, 2, 2, true, false, false, rng);
+    nn::Tensor input(ctx, {1, 1, 2});
+    input.copy_from_host(std::vector<float>{0.25f, -0.5f});
+    expect_mha_matches(layer, input, 1, 1, 2, 2, true, "mha-t1");
+    CHECK(layer.forward(input).shape() == std::vector<int>({1, 1, 2}));
+  }
 }
 
 }  // namespace
@@ -952,6 +1191,8 @@ int test_shapes() {
     }
     CHECK(threw);
   }
+
+  check_multi_head_attention(ctx, rng);
 
   std::printf("shapes ok\n");
   return 0;

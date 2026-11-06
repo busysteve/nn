@@ -405,6 +405,28 @@ In train mode with `p > 0` the layer draws an inverted-dropout mask on the host 
 
 `forward` accepts any rank a tensor can store and returns the same shape. A backward with no forward, or a gradient whose shape differs from the forward output, throws `Dropout backward shape`.
 
+### MultiHeadAttention
+
+Header: `nn/layers/multi_head_attention.hpp`
+
+```cpp
+MultiHeadAttention(Context& ctx, int d_model, int num_heads, bool causal, bool use_bias,
+                   bool use_rope, std::mt19937& rng);
+```
+
+`d_model` and `num_heads` are at least 1, and `d_model` must be divisible by `num_heads` (`MultiHeadAttention size`). `use_rope == true` throws `std::invalid_argument` with message `use_rope`. Rotary positions are not implemented. There is no attention dropout and no key/value cache. `set_training` does not change the result.
+
+The layer owns four `Linear` children, each `d_model` to `d_model`, constructed in order `q`, `k`, `v`, `out`. Each child uses `use_bias` and draws its weight from `rng`. Bias, when present, starts at 0 and consumes no random numbers. Parameter names are the child prefix plus the linear name:
+
+| Name | Shape | Present |
+|---|---|---|
+| `q.weight`, `k.weight`, `v.weight`, `out.weight` | `(d_model, d_model)` | always |
+| `q.bias`, `k.bias`, `v.bias`, `out.bias` | `(d_model)` | when `use_bias` |
+
+`forward` takes `(N, T, d_model)` and returns the same shape. `Dh = d_model / num_heads`. Projections are the child linears. Attention scores are `Q K^T / sqrt(Dh)` with shape `(N, num_heads, T, T)`. When `causal` is true, entries with key index `j > i` are set to `-1e9` before the softmax over the last dimension. The attention output is projected by `out`. A rank other than 3, or a last dimension other than `d_model`, throws `MultiHeadAttention input shape`.
+
+`backward` returns the input shape and adds into each child's `grad_weight` and, when bias is on, `grad_bias`. A missing forward or a mismatched gradient throws `MultiHeadAttention backward shape`. `zero_grad` clears every child.
+
 ### Flatten
 
 Header: `nn/layers/flatten.hpp`
