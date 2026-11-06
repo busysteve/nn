@@ -139,22 +139,6 @@ void launch_merge_heads(cudaStream_t stream, float* dst, const float* src, int t
   check_cuda(cudaGetLastError(), "mha_merge_heads");
 }
 
-void launch_causal_mask(cudaStream_t stream, float* scores, int time, int64_t n) {
-  causal_mask_kernel<<<blocks_for(n), kThreads, 0, stream>>>(scores, time, n);
-  check_cuda(cudaGetLastError(), "mha_causal_mask");
-}
-
-void launch_softmax_rows(cudaStream_t stream, float* out, const float* in, int rows, int cols) {
-  softmax_rows_kernel<<<rows, kThreads, 0, stream>>>(out, in, cols);
-  check_cuda(cudaGetLastError(), "mha_softmax");
-}
-
-void launch_softmax_backward(cudaStream_t stream, float* ds, const float* probs, const float* dp,
-                             int rows, int cols, bool causal) {
-  softmax_backward_kernel<<<rows, kThreads, 0, stream>>>(ds, probs, dp, cols, causal ? 1 : 0);
-  check_cuda(cudaGetLastError(), "mha_softmax_backward");
-}
-
 // Row-major (T, Dh) occupies the same buffer as column-major (Dh, T).
 // S = scale * Q K^T  <=>  S_cm = scale * K_cm^T Q_cm.
 void gemm_scores(cublasHandle_t handle, const float* q, const float* k, float* scores, int time,
@@ -271,8 +255,13 @@ const Tensor& MultiHeadAttention::forward(const Tensor& input) {
   const float scale = 1.f / std::sqrt(static_cast<float>(dh));
   gemm_scores(handle, q_heads_->data(), k_heads_->data(), scores_->data(), time, dh, batch, scale);
   // -1e9, not -inf: a row of infinities makes max-subtract softmax NaN.
-  if (causal_) launch_causal_mask(stream, scores_->data(), time, scores_->numel());
-  launch_softmax_rows(stream, attn_->data(), scores_->data(), batch * time, time);
+  if (causal_) {
+    causal_mask_kernel<<<blocks_for(scores_->numel()), kThreads, 0, stream>>>(scores_->data(), time,
+                                                                              scores_->numel());
+    check_cuda(cudaGetLastError(), "mha_causal_mask");
+  }
+  softmax_rows_kernel<<<batch * time, kThreads, 0, stream>>>(attn_->data(), scores_->data(), time);
+  check_cuda(cudaGetLastError(), "mha_softmax");
   // context = attn V, same row-major product as dQ = dS K with scale 1.
   gemm_dq(handle, v_heads_->data(), attn_->data(), context_->data(), time, dh, batch, 1.f);
   launch_merge_heads(stream, merged_->data(), context_->data(), time, heads, dh, hidden);
@@ -315,8 +304,9 @@ const Tensor& MultiHeadAttention::backward(const Tensor& grad_output) {
   gemm_scores(handle, d_context_->data(), v_heads_->data(), d_attn_->data(), time, dh, batch, 1.f);
   // dV = attn^T dContext, the same product as dK = dS^T Q.
   gemm_dk(handle, d_context_->data(), attn_->data(), d_v_->data(), time, dh, batch, 1.f);
-  launch_softmax_backward(stream, d_scores_->data(), attn_->data(), d_attn_->data(), batch * time,
-                          time, causal_);
+  softmax_backward_kernel<<<batch * time, kThreads, 0, stream>>>(
+      d_scores_->data(), attn_->data(), d_attn_->data(), time, causal_ ? 1 : 0);
+  check_cuda(cudaGetLastError(), "mha_softmax_backward");
   gemm_dq(handle, k_heads_->data(), d_scores_->data(), d_q_->data(), time, dh, batch, scale);
   gemm_dk(handle, q_heads_->data(), d_scores_->data(), d_k_->data(), time, dh, batch, scale);
 
