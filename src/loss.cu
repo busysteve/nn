@@ -140,21 +140,6 @@ __global__ void sequence_ce_kernel(const float* logits, const int64_t* labels, f
   if (threadIdx.x == 0) per_sample[row] = -(row_logits[label] - (max_logit + logf(sum)));
 }
 
-// Freed on every return, including label errors thrown after the scratch alloc.
-struct SequenceScratch {
-  int* counts = nullptr;
-  float* per_sample = nullptr;
-
-  SequenceScratch() = default;
-  SequenceScratch(const SequenceScratch&) = delete;
-  SequenceScratch& operator=(const SequenceScratch&) = delete;
-
-  ~SequenceScratch() {
-    cudaFree(per_sample);
-    cudaFree(counts);
-  }
-};
-
 }  // namespace
 
 DeviceIndices::DeviceIndices(Context& ctx, int64_t n) : ctx_(&ctx), n_(n) {
@@ -250,42 +235,73 @@ LossResult sequence_cross_entropy(Context& ctx, const Tensor& logits, const Inde
 
   // Scale inside the kernel by 1/n_valid, matching softmax_ce_kernel's 1/N.
   // An empty kept set must return before that division.
-  SequenceScratch scratch;
-  check_cuda(cudaMalloc(&scratch.counts, 2 * sizeof(int)), "cudaMalloc");
-  int* bad = scratch.counts;
-  int* n_valid_dev = scratch.counts + 1;
+  LossResult result{0.f, Tensor(ctx, logits.shape())};
+  int* counts = nullptr;
+  float* per_sample = nullptr;
+  check_cuda(cudaMalloc(&counts, 2 * sizeof(int)), "cudaMalloc");
+  int* bad = counts;
+  int* n_valid_dev = counts + 1;
   cudaStream_t stream = stream_of(ctx);
-  check_cuda(cudaMemsetAsync(scratch.counts, 0, 2 * sizeof(int), stream), "cudaMemsetAsync");
+  const cudaError_t set = cudaMemsetAsync(counts, 0, 2 * sizeof(int), stream);
+  if (set != cudaSuccess) {
+    cudaFree(counts);
+    check_cuda(set, "cudaMemsetAsync");
+  }
   constexpr int kCountThreads = 256;
   const int count_blocks =
       static_cast<int>((static_cast<int64_t>(rows) + kCountThreads - 1) / kCountThreads);
   sequence_label_count_kernel<<<count_blocks, kCountThreads, 0, stream>>>(
       labels.data(), rows, classes, ignore_index, n_valid_dev, bad);
-  check_cuda(cudaGetLastError(), "sequence_cross_entropy");
+  const cudaError_t count_launch = cudaGetLastError();
+  if (count_launch != cudaSuccess) {
+    cudaFree(counts);
+    check_cuda(count_launch, "sequence_cross_entropy");
+  }
   ctx.synchronize();
   int bad_host = 0;
   int n_valid = 0;
-  check_cuda(cudaMemcpy(&bad_host, bad, sizeof(int), cudaMemcpyDeviceToHost), "cudaMemcpy");
-  check_cuda(cudaMemcpy(&n_valid, n_valid_dev, sizeof(int), cudaMemcpyDeviceToHost), "cudaMemcpy");
-  if (bad_host) throw Error("label out of range");
-
-  LossResult result{0.f, Tensor(ctx, logits.shape())};
+  const cudaError_t copy_bad = cudaMemcpy(&bad_host, bad, sizeof(int), cudaMemcpyDeviceToHost);
+  if (copy_bad != cudaSuccess) {
+    cudaFree(counts);
+    check_cuda(copy_bad, "cudaMemcpy");
+  }
+  const cudaError_t copy_n = cudaMemcpy(&n_valid, n_valid_dev, sizeof(int), cudaMemcpyDeviceToHost);
+  if (copy_n != cudaSuccess) {
+    cudaFree(counts);
+    check_cuda(copy_n, "cudaMemcpy");
+  }
+  if (bad_host) {
+    cudaFree(counts);
+    throw Error("label out of range");
+  }
   if (n_valid == 0) {
+    cudaFree(counts);
     result.grad_logits.zero();
     ctx.synchronize();
     return result;
   }
 
-  check_cuda(cudaMalloc(&scratch.per_sample, static_cast<size_t>(rows) * sizeof(float)), "cudaMalloc");
+  const cudaError_t alloc = cudaMalloc(&per_sample, static_cast<size_t>(rows) * sizeof(float));
+  if (alloc != cudaSuccess) {
+    cudaFree(counts);
+    check_cuda(alloc, "cudaMalloc");
+  }
   sequence_ce_kernel<<<rows, 128, 0, stream>>>(logits.data(), labels.data(), result.grad_logits.data(),
-                                               scratch.per_sample, rows, classes, ignore_index, n_valid,
-                                               bad);
-  check_cuda(cudaGetLastError(), "sequence_cross_entropy");
+                                               per_sample, rows, classes, ignore_index, n_valid, bad);
+  const cudaError_t launch = cudaGetLastError();
+  if (launch != cudaSuccess) {
+    cudaFree(per_sample);
+    cudaFree(counts);
+    check_cuda(launch, "sequence_cross_entropy");
+  }
 
-  thrust::device_ptr<float> begin(scratch.per_sample);
+  thrust::device_ptr<float> begin(per_sample);
   const float sum = thrust::reduce(thrust::cuda::par.on(stream), begin, begin + rows, 0.f);
   ctx.synchronize();
-  check_cuda(cudaMemcpy(&bad_host, bad, sizeof(int), cudaMemcpyDeviceToHost), "cudaMemcpy");
+  const cudaError_t copy = cudaMemcpy(&bad_host, bad, sizeof(int), cudaMemcpyDeviceToHost);
+  cudaFree(per_sample);
+  cudaFree(counts);
+  check_cuda(copy, "cudaMemcpy");
   if (bad_host) throw Error("label out of range");
   result.loss = sum / static_cast<float>(n_valid);
   return result;
