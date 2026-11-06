@@ -62,6 +62,99 @@ __global__ void softmax_ce_kernel(const float* logits, const int64_t* labels, fl
   if (threadIdx.x == 0) per_sample[row] = -(row_logits[label] - (max_logit + logf(sum)));
 }
 
+// ignore_index is allowed to be negative or >= V. Classification rejects every label < 0.
+__global__ void sequence_label_count_kernel(const int64_t* labels, int rows, int classes,
+                                            int64_t ignore_index, int* n_valid, int* bad) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row >= rows) return;
+  const int64_t label = labels[row];
+  if (label == ignore_index) return;
+  if (label < 0 || label >= static_cast<int64_t>(classes)) {
+    atomicExch(bad, 1);
+    return;
+  }
+  atomicAdd(n_valid, 1);
+}
+
+__global__ void sequence_ce_kernel(const float* logits, const int64_t* labels, float* grad,
+                                   float* per_sample, int rows, int classes, int64_t ignore_index,
+                                   int n_valid, int* bad) {
+  const int row = static_cast<int>(blockIdx.x);
+  if (row >= rows) return;
+  const float* row_logits = logits + static_cast<int64_t>(row) * classes;
+  float* row_grad = grad + static_cast<int64_t>(row) * classes;
+  const int64_t label = labels[row];
+
+  if (label == ignore_index) {
+    for (int c = static_cast<int>(threadIdx.x); c < classes; c += static_cast<int>(blockDim.x)) {
+      row_grad[c] = 0.f;
+    }
+    if (threadIdx.x == 0) per_sample[row] = 0.f;
+    return;
+  }
+  if (label < 0 || label >= static_cast<int64_t>(classes)) {
+    for (int c = static_cast<int>(threadIdx.x); c < classes; c += static_cast<int>(blockDim.x)) {
+      row_grad[c] = 0.f;
+    }
+    if (threadIdx.x == 0) {
+      atomicExch(bad, 1);
+      per_sample[row] = 0.f;
+    }
+    return;
+  }
+
+  float thread_max = -1e30f;
+  for (int c = static_cast<int>(threadIdx.x); c < classes; c += static_cast<int>(blockDim.x)) {
+    thread_max = fmaxf(thread_max, row_logits[c]);
+  }
+  __shared__ float scratch[128];
+  scratch[threadIdx.x] = thread_max;
+  __syncthreads();
+  for (int offset = static_cast<int>(blockDim.x) / 2; offset > 0; offset >>= 1) {
+    if (static_cast<int>(threadIdx.x) < offset) {
+      scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + offset]);
+    }
+    __syncthreads();
+  }
+  const float max_logit = scratch[0];
+  __syncthreads();
+
+  float thread_sum = 0.f;
+  for (int c = static_cast<int>(threadIdx.x); c < classes; c += static_cast<int>(blockDim.x)) {
+    thread_sum += expf(row_logits[c] - max_logit);
+  }
+  scratch[threadIdx.x] = thread_sum;
+  __syncthreads();
+  for (int offset = static_cast<int>(blockDim.x) / 2; offset > 0; offset >>= 1) {
+    if (static_cast<int>(threadIdx.x) < offset) scratch[threadIdx.x] += scratch[threadIdx.x + offset];
+    __syncthreads();
+  }
+  const float sum = scratch[0];
+  const float inv_sum = 1.f / sum;
+  const float inv_n = 1.f / static_cast<float>(n_valid);
+  for (int c = static_cast<int>(threadIdx.x); c < classes; c += static_cast<int>(blockDim.x)) {
+    const float softmax = expf(row_logits[c] - max_logit) * inv_sum;
+    const float indicator = (static_cast<int64_t>(c) == label) ? 1.f : 0.f;
+    row_grad[c] = (softmax - indicator) * inv_n;
+  }
+  if (threadIdx.x == 0) per_sample[row] = -(row_logits[label] - (max_logit + logf(sum)));
+}
+
+// Freed on every return, including label errors thrown after the scratch alloc.
+struct SequenceScratch {
+  int* counts = nullptr;
+  float* per_sample = nullptr;
+
+  SequenceScratch() = default;
+  SequenceScratch(const SequenceScratch&) = delete;
+  SequenceScratch& operator=(const SequenceScratch&) = delete;
+
+  ~SequenceScratch() {
+    cudaFree(per_sample);
+    cudaFree(counts);
+  }
+};
+
 }  // namespace
 
 DeviceIndices::DeviceIndices(Context& ctx, int64_t n) : ctx_(&ctx), n_(n) {
@@ -132,6 +225,69 @@ LossResult softmax_cross_entropy(Context& ctx, const Tensor& logits, const Devic
   cudaFree(bad);
   if (bad_host) throw Error("label out of range");
   result.loss = sum / static_cast<float>(n);
+  return result;
+}
+
+LossResult sequence_cross_entropy(Context& ctx, const Tensor& logits, const IndexTensor& labels,
+                                  int64_t ignore_index) {
+  int classes = 0;
+  int rows = 0;
+  if (logits.rank() == 2) {
+    rows = logits.shape()[0];
+    classes = logits.shape()[1];
+    if (labels.shape().size() != 1 || labels.shape()[0] != rows) throw Error("label shape");
+  } else if (logits.rank() == 3) {
+    if (labels.shape().size() != 2 || labels.shape()[0] != logits.shape()[0] ||
+        labels.shape()[1] != logits.shape()[1]) {
+      throw Error("label shape");
+    }
+    classes = logits.shape()[2];
+    rows = static_cast<int>(static_cast<int64_t>(logits.shape()[0]) * logits.shape()[1]);
+  } else {
+    throw Error("logits rank");
+  }
+  if (classes <= 1) throw Error("logits shape");
+
+  // Scale inside the kernel by 1/n_valid, matching softmax_ce_kernel's 1/N.
+  // An empty kept set must return before that division.
+  SequenceScratch scratch;
+  check_cuda(cudaMalloc(&scratch.counts, 2 * sizeof(int)), "cudaMalloc");
+  int* bad = scratch.counts;
+  int* n_valid_dev = scratch.counts + 1;
+  cudaStream_t stream = stream_of(ctx);
+  check_cuda(cudaMemsetAsync(scratch.counts, 0, 2 * sizeof(int), stream), "cudaMemsetAsync");
+  constexpr int kCountThreads = 256;
+  const int count_blocks =
+      static_cast<int>((static_cast<int64_t>(rows) + kCountThreads - 1) / kCountThreads);
+  sequence_label_count_kernel<<<count_blocks, kCountThreads, 0, stream>>>(
+      labels.data(), rows, classes, ignore_index, n_valid_dev, bad);
+  check_cuda(cudaGetLastError(), "sequence_cross_entropy");
+  ctx.synchronize();
+  int bad_host = 0;
+  int n_valid = 0;
+  check_cuda(cudaMemcpy(&bad_host, bad, sizeof(int), cudaMemcpyDeviceToHost), "cudaMemcpy");
+  check_cuda(cudaMemcpy(&n_valid, n_valid_dev, sizeof(int), cudaMemcpyDeviceToHost), "cudaMemcpy");
+  if (bad_host) throw Error("label out of range");
+
+  LossResult result{0.f, Tensor(ctx, logits.shape())};
+  if (n_valid == 0) {
+    result.grad_logits.zero();
+    ctx.synchronize();
+    return result;
+  }
+
+  check_cuda(cudaMalloc(&scratch.per_sample, static_cast<size_t>(rows) * sizeof(float)), "cudaMalloc");
+  sequence_ce_kernel<<<rows, 128, 0, stream>>>(logits.data(), labels.data(), result.grad_logits.data(),
+                                               scratch.per_sample, rows, classes, ignore_index, n_valid,
+                                               bad);
+  check_cuda(cudaGetLastError(), "sequence_cross_entropy");
+
+  thrust::device_ptr<float> begin(scratch.per_sample);
+  const float sum = thrust::reduce(thrust::cuda::par.on(stream), begin, begin + rows, 0.f);
+  ctx.synchronize();
+  check_cuda(cudaMemcpy(&bad_host, bad, sizeof(int), cudaMemcpyDeviceToHost), "cudaMemcpy");
+  if (bad_host) throw Error("label out of range");
+  result.loss = sum / static_cast<float>(n_valid);
   return result;
 }
 

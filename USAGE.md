@@ -178,6 +178,28 @@ LossResult softmax_cross_entropy(Context& ctx, const Tensor& logits, const Devic
 
 `LossResult` owns `grad_logits`. It is movable and not copyable.
 
+## Sequence cross-entropy
+
+Header: `nn/loss.hpp`
+
+```cpp
+LossResult sequence_cross_entropy(Context& ctx, const Tensor& logits, const IndexTensor& labels,
+                                  int64_t ignore_index = -100);
+```
+
+Mean softmax cross-entropy over a sequence. `logits` is `(N, T, V)` with `labels` `(N, T)`, or `logits` is `(rows, V)` with `labels` `(rows,)`. `V > 1`. Labels are already aligned with the logits. This function does not shift tokens. `grad_logits` has the same shape as `logits`.
+
+A label equal to `ignore_index` is left out of the mean, and that row of `grad_logits` is zero. The default `ignore_index` is `-100`. Any other label outside `[0, V)` throws `label out of range`. The mean and the gradients divide by the number of labels that were kept. If every label is ignored, the loss is `0`, `grad_logits` is all zeros, and the function does not divide by zero.
+
+`softmax_cross_entropy` is unchanged. It still rejects every negative label, including `-100`.
+
+| Condition | Message |
+|---|---|
+| Rank other than 2 or 3 | `logits rank` |
+| `V <= 1` | `logits shape` |
+| Label rank or dimensions do not match `logits` | `label shape` |
+| A label other than `ignore_index` outside `[0, V)` | `label out of range` |
+
 ## NamedParam and NamedBuffer
 
 Header: `nn/layer.hpp`

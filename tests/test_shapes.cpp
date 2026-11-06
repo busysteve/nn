@@ -13,6 +13,7 @@
 #include "nn/layers/residual_block.hpp"
 #include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
+#include "nn/loss.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -111,6 +112,68 @@ void expect_close(const std::vector<float>& got, const std::vector<float>& want,
                  static_cast<double>(want[i]));
     CHECK(false);
   }
+}
+
+void check_sequence_case(nn::Context& ctx, const std::vector<int>& logit_shape,
+                         const std::vector<float>& host_logits, const std::vector<int64_t>& host_labels,
+                         int64_t ignore_index) {
+  CHECK(logit_shape.size() == 2 || logit_shape.size() == 3);
+  const int classes = logit_shape.back();
+  const int rows = logit_shape.size() == 2 ? logit_shape[0] : logit_shape[0] * logit_shape[1];
+  CHECK(classes > 1);
+  CHECK(static_cast<int>(host_logits.size()) == rows * classes);
+  CHECK(static_cast<int>(host_labels.size()) == rows);
+
+  nn::Tensor logits(ctx, logit_shape);
+  logits.copy_from_host(host_logits);
+  std::vector<int> label_shape;
+  if (logit_shape.size() == 3) label_shape = {logit_shape[0], logit_shape[1]};
+  else label_shape = {rows};
+  nn::IndexTensor labels(ctx, label_shape);
+  labels.copy_from_host(host_labels.data(), static_cast<int64_t>(host_labels.size()));
+
+  nn::LossResult seq = nn::sequence_cross_entropy(ctx, logits, labels, ignore_index);
+  CHECK(seq.grad_logits.shape() == logit_shape);
+  const std::vector<float> seq_grad = seq.grad_logits.to_host();
+
+  std::vector<float> valid_logits;
+  std::vector<int64_t> valid_labels;
+  for (int row = 0; row < rows; ++row) {
+    if (host_labels[static_cast<size_t>(row)] == ignore_index) continue;
+    valid_labels.push_back(host_labels[static_cast<size_t>(row)]);
+    const size_t base = static_cast<size_t>(row) * static_cast<size_t>(classes);
+    for (int c = 0; c < classes; ++c) valid_logits.push_back(host_logits[base + static_cast<size_t>(c)]);
+  }
+
+  if (valid_labels.empty()) {
+    CHECK(seq.loss == 0.f);
+    for (float value : seq_grad) CHECK(value == 0.f);
+    return;
+  }
+
+  nn::Tensor flat(ctx, {static_cast<int>(valid_labels.size()), classes});
+  flat.copy_from_host(valid_logits);
+  nn::DeviceIndices device_labels(ctx, static_cast<int64_t>(valid_labels.size()));
+  device_labels.copy_from_host(valid_labels.data(), static_cast<int64_t>(valid_labels.size()));
+  nn::LossResult flat_loss = nn::softmax_cross_entropy(ctx, flat, device_labels);
+  const std::vector<float> got_loss{seq.loss};
+  const std::vector<float> want_loss{flat_loss.loss};
+  expect_close(got_loss, want_loss, "sequence loss");
+
+  const std::vector<float> flat_grad = flat_loss.grad_logits.to_host();
+  std::vector<float> want(static_cast<size_t>(rows) * static_cast<size_t>(classes), 0.f);
+  int valid_row = 0;
+  for (int row = 0; row < rows; ++row) {
+    const size_t base = static_cast<size_t>(row) * static_cast<size_t>(classes);
+    if (host_labels[static_cast<size_t>(row)] == ignore_index) {
+      for (int c = 0; c < classes; ++c) CHECK(seq_grad[base + static_cast<size_t>(c)] == 0.f);
+      continue;
+    }
+    const size_t src = static_cast<size_t>(valid_row) * static_cast<size_t>(classes);
+    for (int c = 0; c < classes; ++c) want[base + static_cast<size_t>(c)] = flat_grad[src + static_cast<size_t>(c)];
+    ++valid_row;
+  }
+  expect_close(seq_grad, want, "sequence grad");
 }
 
 float gelu_ref(float x) {
@@ -685,6 +748,106 @@ int test_shapes() {
     const int64_t zero = 0;
     foreign.copy_from_host(&zero, 1);
     expect_error([&] { layer.forward_indices(foreign); }, "Embedding context");
+  }
+
+  {
+    const std::vector<float> rank3_logits = {0.2f, -0.4f, 0.7f, 1.1f, 0.3f, -0.2f,
+                                             -0.5f, 0.4f, 0.1f, 0.8f, -0.6f, 0.2f};
+    // Default ignore_index is -100. Every position dropped: loss 0, grad 0.
+    check_sequence_case(ctx, {2, 2, 3}, rank3_logits, {-100, -100, -100, -100}, -100);
+    nn::Tensor default_logits(ctx, {2, 2, 3});
+    default_logits.copy_from_host(rank3_logits);
+    nn::IndexTensor default_labels(ctx, {2, 2});
+    const std::vector<int64_t> all_ignored = {-100, -100, -100, -100};
+    default_labels.copy_from_host(all_ignored.data(), static_cast<int64_t>(all_ignored.size()));
+    nn::LossResult defaults = nn::sequence_cross_entropy(ctx, default_logits, default_labels);
+    CHECK(defaults.loss == 0.f);
+    for (float value : defaults.grad_logits.to_host()) CHECK(value == 0.f);
+
+    // ignore_index outside [0, V) is still an ignore, not an out-of-range error.
+    check_sequence_case(ctx, {2, 4}, {0.1f, 0.2f, 0.3f, 0.4f, -0.2f, 0.5f, 0.0f, 0.7f}, {7, 7}, 7);
+
+    // Mixed ignore. Kept rows match softmax_cross_entropy over only those rows.
+    check_sequence_case(ctx, {2, 2, 3}, rank3_logits, {-100, 1, 0, -100}, -100);
+    check_sequence_case(ctx, {3, 4},
+                        {0.2f, -1.f, 0.5f, 0.1f, 0.3f, 0.4f, -0.2f, 0.6f, -0.4f, 0.7f, 0.2f, 0.0f},
+                        {1, 0, 1}, 1);
+
+    check_sequence_case(ctx, {2, 3, 5},
+                        {0.1f, 0.2f, -0.3f, 0.4f, 0.0f, -0.2f, 0.5f, 0.1f, -0.4f, 0.3f,
+                         0.6f, -0.1f, 0.2f, 0.0f, -0.5f, 0.4f, 0.3f, -0.2f, 0.1f, 0.5f,
+                         -0.6f, 0.2f, 0.3f, -0.1f, 0.4f, 0.1f, -0.3f, 0.2f, 0.6f, -0.4f},
+                        {0, 2, 4, 1, 3, 0}, -100);
+    check_sequence_case(ctx, {6, 5},
+                        {0.1f, 0.2f, -0.3f, 0.4f, 0.0f, -0.2f, 0.5f, 0.1f, -0.4f, 0.3f,
+                         0.6f, -0.1f, 0.2f, 0.0f, -0.5f, 0.4f, 0.3f, -0.2f, 0.1f, 0.5f,
+                         -0.6f, 0.2f, 0.3f, -0.1f, 0.4f, 0.1f, -0.3f, 0.2f, 0.6f, -0.4f},
+                        {0, 2, 4, 1, 3, 0}, -100);
+    check_sequence_case(ctx, {2, 1, 4}, {0.2f, -0.1f, 0.4f, 0.0f, -0.3f, 0.5f, 0.1f, -0.2f}, {1, 3},
+                        -100);
+
+    // Wider than the 128-thread reduction, with ignored rows that must be entirely zero.
+    constexpr int wide_classes = 160;
+    constexpr int wide_rows = 4;
+    std::vector<float> wide_logits(static_cast<size_t>(wide_rows * wide_classes));
+    for (int i = 0; i < wide_rows * wide_classes; ++i) {
+      wide_logits[static_cast<size_t>(i)] = 0.015f * static_cast<float>((i % 23) - 11);
+    }
+    check_sequence_case(ctx, {2, 2, wide_classes}, wide_logits, {-100, 7, 159, -100}, -100);
+    check_sequence_case(ctx, {2, 2, wide_classes}, wide_logits, {3, 8, 1, 90}, -100);
+
+    nn::Tensor bad_logits(ctx, {1, 3, 4});
+    bad_logits.fill(0.1f);
+    nn::IndexTensor bad_labels(ctx, {1, 3});
+    const std::vector<int64_t> too_high = {0, 1, 4};
+    bad_labels.copy_from_host(too_high.data(), static_cast<int64_t>(too_high.size()));
+    expect_error([&] { nn::sequence_cross_entropy(ctx, bad_logits, bad_labels); }, "label out of range");
+    const std::vector<int64_t> negative = {0, -1, 1};
+    bad_labels.copy_from_host(negative.data(), static_cast<int64_t>(negative.size()));
+    expect_error([&] { nn::sequence_cross_entropy(ctx, bad_logits, bad_labels); }, "label out of range");
+    const std::vector<int64_t> bad_among_ignored = {1, -100, 4};
+    bad_labels.copy_from_host(bad_among_ignored.data(), static_cast<int64_t>(bad_among_ignored.size()));
+    expect_error([&] { nn::sequence_cross_entropy(ctx, bad_logits, bad_labels); }, "label out of range");
+    const std::vector<int64_t> not_this_ignore = {-100, 1, 0};
+    bad_labels.copy_from_host(not_this_ignore.data(), static_cast<int64_t>(not_this_ignore.size()));
+    expect_error([&] { nn::sequence_cross_entropy(ctx, bad_logits, bad_labels, 0); },
+                 "label out of range");
+
+    nn::Tensor cls_logits(ctx, {2, 3});
+    cls_logits.fill(0.2f);
+    nn::DeviceIndices cls_labels(ctx, 2);
+    const std::vector<int64_t> cls_negative = {0, -1};
+    cls_labels.copy_from_host(cls_negative.data(), static_cast<int64_t>(cls_negative.size()));
+    expect_error([&] { nn::softmax_cross_entropy(ctx, cls_logits, cls_labels); }, "label out of range");
+
+    nn::IndexTensor flat_labels(ctx, {3});
+    const std::vector<int64_t> flat_values = {0, 1, 2};
+    flat_labels.copy_from_host(flat_values.data(), static_cast<int64_t>(flat_values.size()));
+    expect_error([&] { nn::sequence_cross_entropy(ctx, bad_logits, flat_labels); }, "label shape");
+    nn::IndexTensor wrong_t(ctx, {1, 2});
+    const std::vector<int64_t> wrong_t_values = {0, 1};
+    wrong_t.copy_from_host(wrong_t_values.data(), static_cast<int64_t>(wrong_t_values.size()));
+    expect_error([&] { nn::sequence_cross_entropy(ctx, bad_logits, wrong_t); }, "label shape");
+
+    nn::Tensor row_logits(ctx, {4, 3});
+    row_logits.fill(0.f);
+    nn::IndexTensor short_labels(ctx, {3});
+    short_labels.copy_from_host(flat_values.data(), static_cast<int64_t>(flat_values.size()));
+    expect_error([&] { nn::sequence_cross_entropy(ctx, row_logits, short_labels); }, "label shape");
+    nn::IndexTensor square_labels(ctx, {2, 2});
+    const std::vector<int64_t> square_values = {0, 1, 0, 1};
+    square_labels.copy_from_host(square_values.data(), static_cast<int64_t>(square_values.size()));
+    expect_error([&] { nn::sequence_cross_entropy(ctx, row_logits, square_labels); }, "label shape");
+
+    nn::Tensor rank4(ctx, {1, 1, 2, 3});
+    expect_error([&] { nn::sequence_cross_entropy(ctx, rank4, square_labels); }, "logits rank");
+    nn::Tensor rank1(ctx, {4});
+    expect_error([&] { nn::sequence_cross_entropy(ctx, rank1, short_labels); }, "logits rank");
+    nn::Tensor one_class(ctx, {2, 2, 1});
+    nn::IndexTensor one_labels(ctx, {2, 2});
+    const std::vector<int64_t> zeros4 = {0, 0, 0, 0};
+    one_labels.copy_from_host(zeros4.data(), static_cast<int64_t>(zeros4.size()));
+    expect_error([&] { nn::sequence_cross_entropy(ctx, one_class, one_labels); }, "logits shape");
   }
 
   std::printf("shapes ok\n");
