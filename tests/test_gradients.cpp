@@ -2,10 +2,12 @@
 
 #include "nn/layers/batch_norm2d.hpp"
 #include "nn/layers/conv2d.hpp"
+#include "nn/layers/gelu.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/max_pool2d.hpp"
 #include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
+#include "nn/layers/swiglu.hpp"
 #include "nn/loss.hpp"
 
 #include <cmath>
@@ -141,6 +143,30 @@ int test_gradients() {
       values[i] = (i % 2 == 0) ? magnitude : -magnitude;
     }
     input.copy_from_host(values);
+    check_layer(layer, input);
+  }
+
+  std::printf("grad gelu\n");
+  {
+    nn::GELU layer(ctx);
+    nn::Tensor input(ctx, {2, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.8f, 0.8f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad swiglu\n");
+  {
+    nn::SwiGLU layer(ctx);
+    nn::Tensor input(ctx, {2, 6});
+    input.copy_from_host(uniform(input.numel(), rng, -0.8f, 0.8f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad swiglu nchw\n");
+  {
+    nn::SwiGLU layer(ctx);
+    nn::Tensor input(ctx, {2, 2, 2, 2});
+    input.copy_from_host(uniform(input.numel(), rng, -0.8f, 0.8f));
     check_layer(layer, input);
   }
 

@@ -34,6 +34,8 @@ add_library(nn STATIC
   src/elementwise.cu
   src/linear.cpp
   src/relu.cpp
+  src/gelu.cpp
+  src/swiglu.cpp
   src/conv2d.cpp
   src/max_pool2d.cpp
   src/batch_norm2d.cpp

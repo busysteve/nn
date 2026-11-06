@@ -1,5 +1,6 @@
 #include "nn/config.hpp"
 
+#include <climits>
 #include <stdexcept>
 #include <string>
 
@@ -26,8 +27,14 @@ int conv_out_size(int in, int kernel, int stride, int pad) {
 void validate(const MlpConfig& config) {
   require_positive(config.input_size, "input_size");
   require_positive(config.output_size, "output_size");
-  if (config.activation != Activation::Relu) bad("activation");
-  for (int width : config.hidden) require_positive(width, "hidden");
+  if (config.activation != Activation::Relu && config.activation != Activation::Gelu &&
+      config.activation != Activation::SwiGLU) {
+    bad("activation");
+  }
+  for (int width : config.hidden) {
+    require_positive(width, "hidden");
+    if (config.activation == Activation::SwiGLU && width > INT_MAX / 2) bad("hidden");
+  }
 }
 
 void validate(const ConvConfig& config) {

@@ -4,12 +4,17 @@
 #include "nn/conv_resnet.hpp"
 #include "nn/error.hpp"
 #include "nn/layers/conv2d.hpp"
+#include "nn/layers/gelu.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/residual_block.hpp"
+#include "nn/layers/swiglu.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,6 +63,69 @@ void check_io(nn::Context& ctx, nn::Network& net, const std::vector<int>& input_
   grad_output.fill(1.f);
   const nn::Tensor& grad_input = net.backward(grad_output);
   CHECK(grad_input.shape() == input_shape);
+}
+
+void expect_error(const std::function<void()>& call, const std::string& message) {
+  bool threw = false;
+  try {
+    call();
+  } catch (const nn::Error& error) {
+    threw = true;
+    if (message != error.what()) {
+      std::fprintf(stderr, "expected \"%s\", got \"%s\"\n", message.c_str(), error.what());
+      CHECK(false);
+    }
+  }
+  CHECK(threw);
+}
+
+void expect_invalid(const std::function<void()>& call, const std::string& message) {
+  bool threw = false;
+  try {
+    call();
+  } catch (const std::invalid_argument& error) {
+    threw = true;
+    if (message != error.what()) {
+      std::fprintf(stderr, "expected \"%s\", got \"%s\"\n", message.c_str(), error.what());
+      CHECK(false);
+    }
+  }
+  CHECK(threw);
+}
+
+void expect_close(const std::vector<float>& got, const std::vector<float>& want, const char* name) {
+  CHECK(got.size() == want.size());
+  for (size_t i = 0; i < got.size(); ++i) {
+    const double diff = std::abs(static_cast<double>(got[i]) - static_cast<double>(want[i]));
+    const double scale = std::max(1.0, std::max(std::abs(static_cast<double>(got[i])),
+                                                std::abs(static_cast<double>(want[i]))));
+    if (diff / scale <= 1e-5 || diff <= 1e-5) continue;
+    std::fprintf(stderr, "%s[%zu] got %.8g want %.8g\n", name, i, static_cast<double>(got[i]),
+                 static_cast<double>(want[i]));
+    CHECK(false);
+  }
+}
+
+float gelu_ref(float x) {
+  return 0.5f * x * (1.f + std::erff(x * 0.7071067811865476f));
+}
+
+float silu_ref(float x) {
+  const float sigmoid = (x >= 0.f) ? 1.f / (1.f + std::exp(-x)) : std::exp(x) / (1.f + std::exp(x));
+  return x * sigmoid;
+}
+
+std::vector<float> swiglu_ref(const std::vector<float>& input, int rows, int inner) {
+  std::vector<float> output(static_cast<size_t>(rows) * static_cast<size_t>(inner));
+  for (int row = 0; row < rows; ++row) {
+    const float* gate = input.data() + static_cast<size_t>(row) * static_cast<size_t>(inner) * 2;
+    const float* value = gate + inner;
+    for (int col = 0; col < inner; ++col) {
+      output[static_cast<size_t>(row) * static_cast<size_t>(inner) + static_cast<size_t>(col)] =
+          silu_ref(gate[col]) * value[col];
+    }
+  }
+  return output;
 }
 
 void check_block(nn::Context& ctx, int in_channels, int out_channels, int stride,
@@ -111,6 +179,54 @@ int test_shapes() {
   }
 
   {
+    nn::GELU layer(ctx);
+    const std::vector<float> host = {0.f, 1.f, -1.f, 0.5f, -0.25f, 2.f};
+    nn::Tensor input(ctx, {2, 3});
+    input.copy_from_host(host);
+    std::vector<float> want(host.size());
+    for (size_t i = 0; i < host.size(); ++i) want[i] = gelu_ref(host[i]);
+    expect_close(layer.forward(input).to_host(), want, "gelu");
+    nn::Tensor grad(ctx, {2, 3});
+    grad.fill(1.f);
+    CHECK(layer.backward(grad).shape() == input.shape());
+    nn::Tensor rank4(ctx, {1, 2, 2, 2});
+    rank4.fill(0.25f);
+    CHECK(layer.forward(rank4).shape() == rank4.shape());
+    nn::Tensor bad_rank(ctx, {2, 3, 4});
+    expect_error([&] { layer.forward(bad_rank); }, "GELU rank");
+    nn::GELU fresh(ctx);
+    nn::Tensor grad_rank(ctx, {2, 2});
+    expect_error([&] { fresh.backward(grad_rank); }, "GELU backward shape");
+  }
+
+  {
+    nn::SwiGLU layer(ctx);
+    const std::vector<float> host = {1.f, -0.5f, 0.25f, -1.f, 0.5f, 2.f};
+    nn::Tensor input(ctx, {1, 6});
+    input.copy_from_host(host);
+    const nn::Tensor& output = layer.forward(input);
+    CHECK(output.shape() == std::vector<int>({1, 3}));
+    expect_close(output.to_host(), swiglu_ref(host, 1, 3), "swiglu");
+    nn::Tensor grad(ctx, {1, 3});
+    grad.fill(1.f);
+    CHECK(layer.backward(grad).shape() == input.shape());
+
+    const std::vector<float> nchw = {0.5f, -0.25f, 1.5f, -1.f, 0.75f, 0.125f, -0.5f, 2.f};
+    nn::Tensor image(ctx, {1, 4, 1, 2});
+    image.copy_from_host(nchw);
+    const nn::Tensor& pooled = layer.forward(image);
+    CHECK(pooled.shape() == std::vector<int>({1, 2, 1, 2}));
+    expect_close(pooled.to_host(), swiglu_ref(nchw, 1, 4), "swiglu-nchw");
+
+    nn::Tensor odd(ctx, {2, 3});
+    expect_error([&] { layer.forward(odd); }, "SwiGLU size");
+    nn::Tensor bad_rank(ctx, {2, 2, 2});
+    expect_error([&] { layer.forward(bad_rank); }, "SwiGLU rank");
+    nn::Tensor bad_grad(ctx, {1, 6});
+    expect_error([&] { layer.backward(bad_grad); }, "SwiGLU backward shape");
+  }
+
+  {
     nn::MlpConfig config;
     config.input_size = 784;
     config.hidden = {256, 128};
@@ -150,6 +266,61 @@ int test_shapes() {
                         {"fc.3.weight", {4, 5}},
                         {"fc.3.bias", {4}}});
     check_io(ctx, net, {1, 8}, {1, 4});
+  }
+
+  {
+    nn::MlpConfig config;
+    config.input_size = 8;
+    config.hidden = {7, 6};
+    config.output_size = 4;
+    config.activation = nn::Activation::Gelu;
+    nn::Network net = nn::build_mlp(ctx, config, 1);
+    expect_params(net, {{"fc.0.weight", {7, 8}},
+                        {"fc.0.bias", {7}},
+                        {"fc.1.weight", {6, 7}},
+                        {"fc.1.bias", {6}},
+                        {"fc.2.weight", {4, 6}},
+                        {"fc.2.bias", {4}}});
+    check_io(ctx, net, {2, 8}, {2, 4});
+  }
+
+  {
+    nn::MlpConfig config;
+    config.input_size = 8;
+    config.hidden = {6, 5};
+    config.output_size = 4;
+    config.activation = nn::Activation::SwiGLU;
+    nn::Network net = nn::build_mlp(ctx, config, 1);
+    expect_params(net, {{"fc.0.weight", {12, 8}},
+                        {"fc.0.bias", {12}},
+                        {"fc.1.weight", {10, 6}},
+                        {"fc.1.bias", {10}},
+                        {"fc.2.weight", {4, 5}},
+                        {"fc.2.bias", {4}}});
+    check_io(ctx, net, {2, 8}, {2, 4});
+  }
+
+  {
+    nn::MlpConfig config;
+    config.input_size = 16;
+    config.hidden = {};
+    config.output_size = 4;
+    config.activation = nn::Activation::SwiGLU;
+    nn::Network net = nn::build_mlp(ctx, config, 1);
+    expect_params(net, {{"fc.0.weight", {4, 16}}, {"fc.0.bias", {4}}});
+    check_io(ctx, net, {2, 16}, {2, 4});
+  }
+
+  {
+    nn::MlpConfig config;
+    config.input_size = 4;
+    config.hidden = {4};
+    config.output_size = 2;
+    config.activation = static_cast<nn::Activation>(0);
+    expect_invalid([&] { nn::validate(config); }, "activation");
+    config.activation = nn::Activation::SwiGLU;
+    config.hidden = {1 << 30};
+    expect_invalid([&] { nn::validate(config); }, "hidden");
   }
 
   CHECK(nn::conv_out_size(28, 5, 1, 2) == 28);

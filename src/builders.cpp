@@ -3,11 +3,13 @@
 #include "nn/layers/batch_norm2d.hpp"
 #include "nn/layers/conv2d.hpp"
 #include "nn/layers/flatten.hpp"
+#include "nn/layers/gelu.hpp"
 #include "nn/layers/global_avg_pool2d.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/max_pool2d.hpp"
 #include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
+#include "nn/layers/swiglu.hpp"
 
 #include <random>
 
@@ -28,10 +30,20 @@ Network build_mlp(Context& ctx, const MlpConfig& config, uint32_t seed) {
   std::vector<std::unique_ptr<Layer>> layers;
   int in = config.input_size;
   for (size_t i = 0; i < widths.size(); ++i) {
-    auto linear = std::make_unique<Linear>(ctx, in, widths[i], rng);
+    const bool last = i + 1 == widths.size();
+    const int out = (!last && config.activation == Activation::SwiGLU) ? widths[i] * 2 : widths[i];
+    auto linear = std::make_unique<Linear>(ctx, in, out, rng);
     linear->set_name(index_name("fc", i));
     layers.push_back(std::move(linear));
-    if (i + 1 != widths.size()) layers.push_back(std::make_unique<ReLU>(ctx));
+    if (!last) {
+      if (config.activation == Activation::Gelu) {
+        layers.push_back(std::make_unique<GELU>(ctx));
+      } else if (config.activation == Activation::SwiGLU) {
+        layers.push_back(std::make_unique<SwiGLU>(ctx));
+      } else {
+        layers.push_back(std::make_unique<ReLU>(ctx));
+      }
+    }
     in = widths[i];
   }
   return Network(ctx, Family::Mlp, std::move(layers), config);

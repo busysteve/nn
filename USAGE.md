@@ -234,6 +234,39 @@ explicit ReLU(Context& ctx);
 
 No parameters. `forward` and `backward` accept rank 2 or rank 4 and return the same shape. Rank 2 is presented to cuDNN as `(N, 1, 1, F)`. Any other rank throws `ReLU rank`. `backward` requires the gradient shape to match the saved forward output and throws `ReLU backward shape` otherwise. `zero_grad` is empty.
 
+### GELU
+
+Header: `nn/layers/gelu.hpp`
+
+```cpp
+explicit GELU(Context& ctx);
+```
+
+No parameters. `forward` and `backward` accept rank 2 or rank 4 and return the same shape. Any other rank throws `GELU rank`.
+
+```
+GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+```
+
+`forward` stores the input. `backward` multiplies the incoming gradient by `Φ(x) + x φ(x)`, where `Φ` is the standard normal CDF and `φ` is its density. A gradient whose shape differs from the saved input throws `GELU backward shape`. `zero_grad` is empty.
+
+### SwiGLU
+
+Header: `nn/layers/swiglu.hpp`
+
+```cpp
+explicit SwiGLU(Context& ctx);
+```
+
+No parameters. Rank 2 `(N, 2F)` returns `(N, F)`. Rank 4 `(N, 2C, H, W)` returns `(N, C, H, W)`. The split is dimension 1. The first half is the gate `a` and the second half is the value `b`:
+
+```
+y = SiLU(a) * b
+SiLU(a) = a * sigmoid(a)
+```
+
+Any other rank throws `SwiGLU rank`. An odd size on dimension 1 throws `SwiGLU size`. `forward` stores the input. `backward` returns the input shape. A gradient whose shape differs from the forward output throws `SwiGLU backward shape`. `zero_grad` is empty.
+
 ### Conv2d
 
 Header: `nn/layers/conv2d.hpp`
@@ -367,7 +400,7 @@ int conv_out_size(int in, int kernel, int stride, int pad);
 The result is `(in + 2 * pad - kernel) / stride + 1`. `kernel` and `stride` are at least 1 (`kernel`, `stride`). `pad` is at least 0 (`pad`). A result below 1 throws `spatial`.
 
 ```cpp
-enum class Activation : uint32_t { Relu = 1 };
+enum class Activation : uint32_t { Relu = 1, Gelu = 2, SwiGLU = 3 };
 ```
 
 ### MlpConfig
@@ -381,7 +414,23 @@ struct MlpConfig {
 };
 ```
 
-`input_size`, every hidden width, and `output_size` are at least 1. `activation` is `Activation::Relu`. An empty `hidden` builds one linear layer. `build_mlp` emits `Linear`, `ReLU`, `Linear`, `ReLU`, ..., `Linear`. The last linear layer has no ReLU. Names are `fc.0`, `fc.1`, ... Input shape is `(N, input_size)`. Output shape is `(N, output_size)`.
+`input_size`, every hidden width, and `output_size` are at least 1. `activation` is `Activation::Relu`, `Activation::Gelu`, or `Activation::SwiGLU`. Any other value throws `activation`.
+
+`Relu` and `Gelu` keep each hidden width. `build_mlp` emits `Linear`, the activation, `Linear`, the activation, ..., `Linear`. The last linear layer has no activation. A hidden width `H` is the output width of that linear layer.
+
+`SwiGLU` uses `H` as the width after the gate. The linear layer before each `SwiGLU` writes `2H` features, so `fc.i.weight` on a hidden layer has shape `(2H, in)` and `fc.i.bias` has shape `(2H)`. `SwiGLU` returns `H` features. The next linear layer reads `H`. The last linear layer writes `output_size` and has no gate. A hidden width above `INT_MAX / 2` throws `hidden`, because `2H` has to fit in a signed 32-bit feature count.
+
+An empty `hidden` builds one linear layer for every activation. Names are `fc.0`, `fc.1`, ... Input shape is `(N, input_size)`. Output shape is `(N, output_size)`.
+
+```cpp
+config.activation = nn::Activation::Gelu;
+
+config.activation = nn::Activation::SwiGLU;
+config.input_size = 8;
+config.hidden = {6};
+config.output_size = 4;
+// fc.0.weight is (12, 8). SwiGLU returns 6 features. fc.1.weight is (4, 6).
+```
 
 ### ConvSpec and PoolSpec
 

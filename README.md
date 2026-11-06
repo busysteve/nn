@@ -1,6 +1,6 @@
 # nn
 
-A single-GPU C++17 library that builds and trains multilayer perceptrons, convolutional networks, and basic-block ResNets. `ConvResNet` is one network that can include a conv+pool trunk, residual stages, or both. Depth and width come from a config. Each trainable layer implements its own forward and backward pass. The network chains those layers. Training uses mean softmax cross-entropy and SGD with momentum. A checkpoint restores parameters, batch-norm state, the train or eval flag, and, when requested, the optimizer, so a new process can evaluate or resume training.
+A single-GPU C++17 library that builds and trains multilayer perceptrons, convolutional networks, and basic-block ResNets. `ConvResNet` is one network that can include a conv+pool trunk, residual stages, or both. Depth and width come from a config. Each trainable layer implements its own forward and backward pass. The network chains those layers. An MLP selects ReLU, GELU, or SwiGLU between its hidden linear layers. Training uses mean softmax cross-entropy and SGD with momentum. A checkpoint restores parameters, batch-norm state, the train or eval flag, and, when requested, the optimizer, so a new process can evaluate or resume training.
 
 The acceptance suite is MNIST. Public headers live under `include/nn/` and do not include CUDA, cuBLAS, or cuDNN headers.
 
@@ -41,7 +41,7 @@ Everything is in namespace `nn`.
 
 ## Classes
 
-`Layer` is the abstract base. `Network` owns an ordered list of layers. A `ResidualBlock` owns the convolutions, batch-norm layers, and ReLUs on its main path and on its projection skip. `ConvResNet` owns one `Network` whose family is `ConvResNet`. `build_mlp`, `build_conv`, `build_resnet`, and `build_conv_resnet` are free functions that return one `Network`. `softmax_cross_entropy` is a free function that reads a `Tensor` and a `DeviceIndices` and returns a `LossResult`.
+`Layer` is the abstract base. `Network` owns an ordered list of layers. A `ResidualBlock` owns the convolutions, batch-norm layers, and ReLUs on its main path and on its projection skip. `GELU` and `SwiGLU` are parameter-free activations. `build_mlp` places `ReLU`, `GELU`, or `SwiGLU` between hidden linear layers. `ConvResNet` owns one `Network` whose family is `ConvResNet`. `build_mlp`, `build_conv`, `build_resnet`, and `build_conv_resnet` are free functions that return one `Network`. `softmax_cross_entropy` is a free function that reads a `Tensor` and a `DeviceIndices` and returns a `LossResult`.
 
 ```mermaid
 classDiagram
@@ -93,6 +93,8 @@ classDiagram
     }
     Layer <|-- Linear
     Layer <|-- ReLU
+    Layer <|-- GELU
+    Layer <|-- SwiGLU
     Layer <|-- Conv2d
     Layer <|-- MaxPool2d
     Layer <|-- BatchNorm2d
@@ -266,11 +268,13 @@ Generator order follows construction order:
 | `input_size` | Features in one example. |
 | `hidden` | Width of each hidden layer, in order. Empty is legal and builds a single linear map. |
 | `output_size` | Logit width. |
-| `activation` | `Activation::Relu` (value 1). Any other value is rejected. |
+| `activation` | `Activation::Relu` (1), `Activation::Gelu` (2), or `Activation::SwiGLU` (3). |
 
-The builder emits `Linear`, `ReLU`, `Linear`, `ReLU`, ..., `Linear`. The last linear layer has no ReLU. Layer names are `fc.0`, `fc.1`, ...
+`Relu` and `Gelu` keep each hidden width. The builder emits `Linear`, the activation, `Linear`, the activation, ..., `Linear`. The last linear layer has no activation. A hidden width `H` is the output width of that linear layer.
 
-Input shape is `(N, input_size)`. Output shape is `(N, output_size)`.
+`SwiGLU` uses `H` as the width after the gate. The linear layer before each `SwiGLU` writes `2H` features. `SwiGLU` returns `H` features, and the next linear layer reads `H`. The last linear layer writes `output_size` and has no gate. An empty `hidden` is one linear layer for every activation. On a hidden layer, `fc.i.weight` has shape `(2H, in)`.
+
+Layer names are `fc.0`, `fc.1`, ... Input shape is `(N, input_size)`. Output shape is `(N, output_size)`.
 
 ### ConvConfig
 
@@ -384,6 +388,35 @@ explicit ReLU(Context& ctx);
 ```
 
 No parameters. Rank 2 is described to cuDNN as `(N, 1, 1, F)`. Rank 4 is NCHW. Other ranks throw. Forward stores the input and the output. Backward is `cudnnActivationBackward` with `CUDNN_ACTIVATION_RELU`. The output cache is required by that call.
+
+### GELU
+
+```cpp
+explicit GELU(Context& ctx);
+```
+
+No parameters. Rank 2 and rank 4 keep their shape. Any other rank throws `GELU rank`.
+
+```
+GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+```
+
+Forward stores the input. Backward multiplies the incoming gradient by `Φ(x) + x φ(x)`, where `Φ` is the standard normal CDF and `φ` is its density. A gradient whose shape differs from the saved input throws `GELU backward shape`.
+
+### SwiGLU
+
+```cpp
+explicit SwiGLU(Context& ctx);
+```
+
+No parameters. Rank 2 `(N, 2F)` returns `(N, F)`. Rank 4 `(N, 2C, H, W)` returns `(N, C, H, W)`. The split is dimension 1. The first half is the gate `a` and the second half is the value `b`:
+
+```
+y = SiLU(a) * b
+SiLU(a) = a * sigmoid(a)
+```
+
+Any other rank throws `SwiGLU rank`. An odd size on dimension 1 throws `SwiGLU size`. Forward stores the input. Backward returns the input shape. A gradient whose shape differs from the forward output throws `SwiGLU backward shape`.
 
 ### Conv2d
 
@@ -558,7 +591,7 @@ A train flag or optimizer flag outside `{0, 1}`, or a non-zero reserved word, th
 
 Padding to 8 bytes follows the config. Integers are `int32` unless noted.
 
-MLP: `input_size`, `output_size`, activation `uint32`, hidden count `uint32`, then that many widths.
+MLP: `input_size`, `output_size`, activation `uint32` (`1` ReLU, `2` GELU, `3` SwiGLU), hidden count `uint32`, then that many widths.
 
 Conv: `in_channels`, `in_height`, `in_width`, pool kernel, pool stride, conv count `uint32`, then each conv as `out_channels`, `kernel`, `stride`, `pad`, then fully-connected count `uint32` and those widths.
 
@@ -690,11 +723,11 @@ CTest timeouts are 900 seconds for `shapes`, `grads`, and `ckpt`, and 7200 secon
 
 Images are scaled by `1/255` into `[0, 1]`. Labels are `int64` class indices. The loader is part of the test binary, not the library.
 
-`shapes` checks forward and backward ranks for several depths and widths of each family, including a ResNet stage that downsamples, a stage that uses a projection, and a ConvResNet with a conv trunk, a stem, and residual stages.
+`shapes` checks forward and backward ranks for several depths and widths of each family, including a ResNet stage that downsamples, a stage that uses a projection, a ConvResNet with a conv trunk, a stem, and residual stages, and MLP networks that use GELU and SwiGLU.
 
-`grads` compares analytic backward with central finite differences at epsilon `1e-3`. Parameter gradients pass when the relative error is at most `1e-2` or the absolute error is at most `1e-4`. Softmax cross-entropy uses relative `1e-5` on the scalar loss and relative `1e-4` on `grad_logits`.
+`grads` compares analytic backward with central finite differences at epsilon `1e-3`, including GELU and SwiGLU. Parameter gradients pass when the relative error is at most `1e-2` or the absolute error is at most `1e-4`. Softmax cross-entropy uses relative `1e-5` on the scalar loss and relative `1e-4` on `grad_logits`.
 
-`ckpt` saves one small network of each family, loads it into a new context, and compares parameter bytes and batch-norm statistics bitwise. A second eval forward matches the original logits bitwise. A truncated file and a tampered size field throw. Reloading with `LoadMode::Resume` restores momentum and the step, and one more optimizer step matches a network that was never saved.
+`ckpt` saves one small network of each family, plus GELU and SwiGLU MLPs, loads each into a new context, and compares parameter bytes and batch-norm statistics bitwise. A second eval forward matches the original logits bitwise. A truncated file and a tampered size field throw. Reloading with `LoadMode::Resume` restores momentum and the step, and one more optimizer step matches a network that was never saved.
 
 `mnist` trains three models with seed 1, batch 128 (the last training batch has 96 examples), eval batch 256 (the last eval batch has 16), and momentum 0.9. The data order of each epoch is shuffled with `std::mt19937(1 + epoch)`.
 
@@ -710,6 +743,6 @@ At the start of the ResNet's last epoch the test zeros every `running_mean`, fil
 
 ## Scope
 
-The library is a fixed set of layers with manual backward passes, four builders, one loss, one optimizer, and one checkpoint version. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
+The library is a fixed set of layers with manual backward passes, four builders, one loss, one optimizer, and one checkpoint version. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
 
-It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, and ConvResNet models that can include a conv trunk, residual stages, or both. The training set exercised by the suite is MNIST.
+It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, and ConvResNet models that can include a conv trunk, residual stages, or both. Conv, ResNet, and ConvResNet builders use ReLU. The training set exercised by the suite is MNIST.

@@ -5,7 +5,7 @@
 
 namespace nn {
 
-enum class Activation : uint32_t { Relu = 1 };
+enum class Activation : uint32_t { Relu = 1, Gelu = 2, SwiGLU = 3 };
 
 struct MlpConfig {
   int input_size = 0;

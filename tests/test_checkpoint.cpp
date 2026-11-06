@@ -14,6 +14,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -210,6 +211,33 @@ int test_checkpoint() {
     Batch train{{2, 8}, uniform(16, rng), {0, 1}};
     Batch probe{{2, 8}, uniform(16, rng), {1, 0}};
     round_trip(nn::build_mlp(ctx, config, 1), ctx, dir / "mlp.bin", train, probe, false);
+  }
+  {
+    nn::MlpConfig config;
+    config.input_size = 8;
+    config.hidden = {6};
+    config.output_size = 4;
+    config.activation = nn::Activation::Gelu;
+    Batch train{{2, 8}, uniform(16, rng), {0, 1}};
+    Batch probe{{2, 8}, uniform(16, rng), {1, 0}};
+    round_trip(nn::build_mlp(ctx, config, 1), ctx, dir / "mlp-gelu.bin", train, probe, false);
+    nn::Network::Loaded loaded =
+        nn::Network::load(ctx, dir / "mlp-gelu.bin", nn::LoadMode::Inference);
+    CHECK(std::get<nn::MlpConfig>(loaded.network.config()).activation == nn::Activation::Gelu);
+  }
+  {
+    nn::MlpConfig config;
+    config.input_size = 8;
+    config.hidden = {6};
+    config.output_size = 4;
+    config.activation = nn::Activation::SwiGLU;
+    Batch train{{2, 8}, uniform(16, rng), {0, 1}};
+    Batch probe{{2, 8}, uniform(16, rng), {1, 0}};
+    round_trip(nn::build_mlp(ctx, config, 1), ctx, dir / "mlp-swiglu.bin", train, probe, false);
+    nn::Network::Loaded loaded =
+        nn::Network::load(ctx, dir / "mlp-swiglu.bin", nn::LoadMode::Inference);
+    CHECK(std::get<nn::MlpConfig>(loaded.network.config()).activation == nn::Activation::SwiGLU);
+    CHECK(loaded.network.parameters()[0].value->shape() == std::vector<int>({12, 8}));
   }
   {
     nn::ConvConfig config;
