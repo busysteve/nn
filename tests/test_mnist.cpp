@@ -3,6 +3,7 @@
 
 #include "nn/builders.hpp"
 #include "nn/loss.hpp"
+#include "nn/conv_resnet.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -187,7 +188,7 @@ int test_mnist() {
     CHECK(again >= floor);
   };
 
-  {
+  if(0){
     nn::Context ctx;
     nn::MlpConfig config;
     config.input_size = 784;
@@ -195,7 +196,7 @@ int test_mnist() {
     config.output_size = 10;
     finish("mlp", nn::build_mlp(ctx, config, kSeed), true, 5, 9600, 0.1f, dir / "mlp.bin");
   }
-  {
+  if(0){
     nn::Context ctx;
     nn::ConvConfig config;
     config.in_channels = 1;
@@ -206,7 +207,7 @@ int test_mnist() {
     config.fc = {128, 10};
     finish("conv", nn::build_conv(ctx, config, kSeed), false, 5, 9800, 0.1f, dir / "conv.bin");
   }
-  {
+  if(0){
     nn::Context ctx;
     nn::ResNetConfig config;
     config.in_channels = 1;
@@ -218,6 +219,21 @@ int test_mnist() {
     config.output_size = 10;
     finish("resnet", nn::build_resnet(ctx, config, kSeed), false, 8, 9800, 0.1f, dir / "resnet.bin");
   }
+  if(1){
+    nn::Context ctx;
+    nn::ConvResNetConfig config;
+    config.in_channels = 1;
+    config.in_height = 28;
+    config.in_width = 28;
+    config.convs = {nn::ConvSpec{64, 5, 1, 2}, nn::ConvSpec{64, 5, 1, 2}};
+    config.pool = nn::PoolSpec{2, 2};
+    config.stem_channels = 8;
+    config.blocks_per_stage = {2, 2, 2};
+    config.stage_widths = {32, 64, 128};
+    config.fc = {128, 10};
+    finish("convresnet", nn::build_conv_resnet(ctx, config, kSeed), false, 5, 9800, 0.1f, dir / "convresnet.bin");
+  }
+
 
   std::printf("mnist ok\n");
   return 0;

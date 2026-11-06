@@ -208,11 +208,12 @@ Header read_header(ByteReader& reader) {
   if (reserved != 0 || header.training > 1 || header.optimizer_present > 1) {
     throw Error("bad checkpoint header");
   }
-  if (header.family < 1 || header.family > 3) throw Error("bad checkpoint family");
+  if (header.family < 1 || header.family > 4) throw Error("bad checkpoint family");
   return header;
 }
 
-std::variant<MlpConfig, ConvConfig, ResNetConfig> read_config(ByteReader& reader, uint32_t family) {
+std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig> read_config(ByteReader& reader,
+                                                                                 uint32_t family) {
   if (family == 1) {
     MlpConfig config;
     config.input_size = reader.i32();
@@ -250,23 +251,59 @@ std::variant<MlpConfig, ConvConfig, ResNetConfig> read_config(ByteReader& reader
     validate(config);
     return config;
   }
-  ResNetConfig config;
-  config.in_channels = reader.i32();
-  config.in_height = reader.i32();
-  config.in_width = reader.i32();
-  config.stem_channels = reader.i32();
-  config.output_size = reader.i32();
-  const uint32_t stage_count = reader.u32();
-  if (stage_count > 1000000u) throw Error("truncated checkpoint");
-  config.blocks_per_stage.resize(stage_count);
-  config.stage_widths.resize(stage_count);
-  for (uint32_t i = 0; i < stage_count; ++i) {
-    config.blocks_per_stage[i] = reader.i32();
-    config.stage_widths[i] = reader.i32();
+  if (family == 3) {
+    ResNetConfig config;
+    config.in_channels = reader.i32();
+    config.in_height = reader.i32();
+    config.in_width = reader.i32();
+    config.stem_channels = reader.i32();
+    config.output_size = reader.i32();
+    const uint32_t stage_count = reader.u32();
+    if (stage_count > 1000000u) throw Error("truncated checkpoint");
+    config.blocks_per_stage.resize(stage_count);
+    config.stage_widths.resize(stage_count);
+    for (uint32_t i = 0; i < stage_count; ++i) {
+      config.blocks_per_stage[i] = reader.i32();
+      config.stage_widths[i] = reader.i32();
+    }
+    reader.pad8();
+    validate(config);
+    return config;
   }
-  reader.pad8();
-  validate(config);
-  return config;
+  if (family == 4) {
+    ConvResNetConfig config;
+    config.in_channels = reader.i32();
+    config.in_height = reader.i32();
+    config.in_width = reader.i32();
+    config.stem_channels = reader.i32();
+    config.pool.kernel = reader.i32();
+    config.pool.stride = reader.i32();
+    const uint32_t conv_count = reader.u32();
+    if (conv_count > 1000000u) throw Error("truncated checkpoint");
+    config.convs.resize(conv_count);
+    for (uint32_t i = 0; i < conv_count; ++i) {
+      config.convs[i].out_channels = reader.i32();
+      config.convs[i].kernel = reader.i32();
+      config.convs[i].stride = reader.i32();
+      config.convs[i].pad = reader.i32();
+    }
+    const uint32_t stage_count = reader.u32();
+    if (stage_count > 1000000u) throw Error("truncated checkpoint");
+    config.blocks_per_stage.resize(stage_count);
+    config.stage_widths.resize(stage_count);
+    for (uint32_t i = 0; i < stage_count; ++i) {
+      config.blocks_per_stage[i] = reader.i32();
+      config.stage_widths[i] = reader.i32();
+    }
+    const uint32_t fc_count = reader.u32();
+    if (fc_count > 1000000u) throw Error("truncated checkpoint");
+    config.fc.resize(fc_count);
+    for (uint32_t i = 0; i < fc_count; ++i) config.fc[i] = reader.i32();
+    reader.pad8();
+    validate(config);
+    return config;
+  }
+  throw Error("bad checkpoint family");
 }
 
 std::vector<ParsedParam> read_params(ByteReader& reader, uint32_t* count_out) {
@@ -381,7 +418,7 @@ void Network::save(const std::filesystem::path& path, const Sgd* optimizer) cons
           }
           writer.u32(static_cast<uint32_t>(config.fc.size()));
           for (int width : config.fc) writer.i32(width);
-        } else {
+        } else if constexpr (std::is_same_v<T, ResNetConfig>) {
           writer.i32(config.in_channels);
           writer.i32(config.in_height);
           writer.i32(config.in_width);
@@ -392,6 +429,28 @@ void Network::save(const std::filesystem::path& path, const Sgd* optimizer) cons
             writer.i32(config.blocks_per_stage[i]);
             writer.i32(config.stage_widths[i]);
           }
+        } else {
+          static_assert(std::is_same_v<T, ConvResNetConfig>);
+          writer.i32(config.in_channels);
+          writer.i32(config.in_height);
+          writer.i32(config.in_width);
+          writer.i32(config.stem_channels);
+          writer.i32(config.pool.kernel);
+          writer.i32(config.pool.stride);
+          writer.u32(static_cast<uint32_t>(config.convs.size()));
+          for (const ConvSpec& spec : config.convs) {
+            writer.i32(spec.out_channels);
+            writer.i32(spec.kernel);
+            writer.i32(spec.stride);
+            writer.i32(spec.pad);
+          }
+          writer.u32(static_cast<uint32_t>(config.blocks_per_stage.size()));
+          for (size_t i = 0; i < config.blocks_per_stage.size(); ++i) {
+            writer.i32(config.blocks_per_stage[i]);
+            writer.i32(config.stage_widths[i]);
+          }
+          writer.u32(static_cast<uint32_t>(config.fc.size()));
+          for (int width : config.fc) writer.i32(width);
         }
       },
       config_);
@@ -474,7 +533,8 @@ Network::Loaded Network::load(Context& ctx, const std::filesystem::path& path, L
         using T = std::decay_t<decltype(cfg)>;
         if constexpr (std::is_same_v<T, MlpConfig>) return build_mlp(ctx, cfg, 0);
         else if constexpr (std::is_same_v<T, ConvConfig>) return build_conv(ctx, cfg, 0);
-        else return build_resnet(ctx, cfg, 0);
+        else if constexpr (std::is_same_v<T, ResNetConfig>) return build_resnet(ctx, cfg, 0);
+        else return build_conv_resnet(ctx, cfg, 0);
       },
       config);
 

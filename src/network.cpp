@@ -13,7 +13,7 @@ std::string join_name(const std::string& prefix, const std::string& name) {
 }  // namespace
 
 Network::Network(Context& ctx, Family family, std::vector<std::unique_ptr<Layer>> layers,
-                 std::variant<MlpConfig, ConvConfig, ResNetConfig> config)
+                 std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig> config)
     : ctx_(&ctx), family_(family), layers_(std::move(layers)), config_(std::move(config)) {}
 
 const Tensor& Network::forward(const Tensor& input) {

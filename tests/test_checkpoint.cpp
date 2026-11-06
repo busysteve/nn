@@ -1,6 +1,7 @@
 #include "check.hpp"
 
 #include "nn/builders.hpp"
+#include "nn/conv_resnet.hpp"
 #include "nn/error.hpp"
 #include "nn/loss.hpp"
 
@@ -235,6 +236,30 @@ int test_checkpoint() {
     Batch probe{{2, 1, 8, 8}, uniform(2 * 64, rng), {2, 3}};
     round_trip(nn::build_resnet(ctx, config, 1), ctx, dir / "resnet.bin", train, probe, true);
   }
+  {
+    nn::ConvResNetConfig config;
+    config.in_channels = 1;
+    config.in_height = 8;
+    config.in_width = 8;
+    config.convs = {nn::ConvSpec{4, 3, 1, 1}};
+    config.pool = nn::PoolSpec{2, 2};
+    config.stem_channels = 4;
+    config.blocks_per_stage = {1, 1};
+    config.stage_widths = {4, 8};
+    config.fc = {4};
+    Batch train{{2, 1, 8, 8}, uniform(2 * 64, rng), {0, 1}};
+    Batch probe{{2, 1, 8, 8}, uniform(2 * 64, rng), {2, 3}};
+    const std::filesystem::path path = dir / "convresnet.bin";
+    round_trip(nn::build_conv_resnet(ctx, config, 1), ctx, path, train, probe, true);
+
+    nn::ConvResNet::Loaded loaded = nn::ConvResNet::load(ctx, path, nn::LoadMode::Resume);
+    CHECK(loaded.model.family() == nn::Family::ConvResNet);
+    CHECK(loaded.optimizer.has_value());
+    CHECK(loaded.step == 1);
+    CHECK(loaded.model.config().fc == config.fc);
+    CHECK(loaded.model.config().convs.size() == 1);
+    CHECK(loaded.model.config().blocks_per_stage.size() == 2);
+  }
 
   const std::filesystem::path mlp = dir / "mlp.bin";
   {
@@ -278,6 +303,8 @@ int test_checkpoint() {
     nn::Network::Loaded loaded = nn::Network::load(ctx, mlp, nn::LoadMode::Inference);
     CHECK(!loaded.optimizer.has_value());
     CHECK(loaded.step == 1);
+    expect_throw([&] { nn::ConvResNet::load(ctx, mlp, nn::LoadMode::Inference); },
+                 "bad checkpoint family");
     CHECK(!loaded.network.training());
   }
 

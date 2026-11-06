@@ -1,6 +1,8 @@
 #include "check.hpp"
 
 #include "nn/builders.hpp"
+#include "nn/conv_resnet.hpp"
+#include "nn/error.hpp"
 #include "nn/layers/conv2d.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/residual_block.hpp"
@@ -253,6 +255,99 @@ int test_shapes() {
   check_block(ctx, 4, 4, 1, {2, 4, 8, 8}, {2, 4, 8, 8}, false);
   check_block(ctx, 4, 8, 1, {2, 4, 8, 8}, {2, 8, 8, 8}, true);
   check_block(ctx, 4, 8, 2, {2, 4, 8, 8}, {2, 8, 4, 4}, true);
+
+  {
+    nn::ConvResNetConfig config;
+    config.in_channels = 1;
+    config.in_height = 8;
+    config.in_width = 8;
+    config.convs = {nn::ConvSpec{4, 3, 1, 1}};
+    config.pool = nn::PoolSpec{2, 2};
+    config.stem_channels = 4;
+    config.blocks_per_stage = {1, 1};
+    config.stage_widths = {4, 8};
+    config.fc = {4};
+    nn::ConvResNet model(ctx, config, 1);
+    CHECK(model.family() == nn::Family::ConvResNet);
+    CHECK(model.training());
+    CHECK(model.config().stem_channels == 4);
+    CHECK(model.parameters().size() == model.network().parameters().size());
+    expect_params(model.network(), {{"conv.0.weight", {4, 1, 3, 3}},
+                                    {"conv.0.bias", {4}},
+                                    {"stem.weight", {4, 4, 3, 3}},
+                                    {"stem.bn.weight", {4}},
+                                    {"stem.bn.bias", {4}},
+                                    {"stages.0.blocks.0.conv1.weight", {4, 4, 3, 3}},
+                                    {"stages.0.blocks.0.bn1.weight", {4}},
+                                    {"stages.0.blocks.0.bn1.bias", {4}},
+                                    {"stages.0.blocks.0.conv2.weight", {4, 4, 3, 3}},
+                                    {"stages.0.blocks.0.bn2.weight", {4}},
+                                    {"stages.0.blocks.0.bn2.bias", {4}},
+                                    {"stages.1.blocks.0.conv1.weight", {8, 4, 3, 3}},
+                                    {"stages.1.blocks.0.bn1.weight", {8}},
+                                    {"stages.1.blocks.0.bn1.bias", {8}},
+                                    {"stages.1.blocks.0.conv2.weight", {8, 8, 3, 3}},
+                                    {"stages.1.blocks.0.bn2.weight", {8}},
+                                    {"stages.1.blocks.0.bn2.bias", {8}},
+                                    {"stages.1.blocks.0.proj.weight", {8, 4, 1, 1}},
+                                    {"stages.1.blocks.0.proj_bn.weight", {8}},
+                                    {"stages.1.blocks.0.proj_bn.bias", {8}},
+                                    {"fc.0.weight", {4, 8}},
+                                    {"fc.0.bias", {4}}});
+    CHECK(!has_param(model.network(), "stages.0.blocks.0.proj.weight"));
+    check_io(ctx, model.network(), {2, 1, 8, 8}, {2, 4});
+  }
+
+  {
+    nn::ConvResNetConfig config;
+    config.in_channels = 1;
+    config.in_height = 8;
+    config.in_width = 8;
+    config.convs = {nn::ConvSpec{4, 3, 1, 1}};
+    config.pool = nn::PoolSpec{2, 2};
+    config.fc = {4};
+    nn::ConvResNet model(ctx, config, 1);
+    expect_params(model.network(), {{"conv.0.weight", {4, 1, 3, 3}},
+                                    {"conv.0.bias", {4}},
+                                    {"fc.0.weight", {4, 64}},
+                                    {"fc.0.bias", {4}}});
+    CHECK(!has_param(model.network(), "stem.weight"));
+    check_io(ctx, model.network(), {2, 1, 8, 8}, {2, 4});
+  }
+
+  {
+    nn::ConvResNetConfig config;
+    config.in_channels = 1;
+    config.in_height = 8;
+    config.in_width = 8;
+    config.stem_channels = 4;
+    config.blocks_per_stage = {1, 1};
+    config.stage_widths = {4, 8};
+    config.fc = {4};
+    nn::ConvResNet model(ctx, config, 1);
+    CHECK(find_param(model.network(), "stem.weight")->shape() == std::vector<int>({4, 1, 3, 3}));
+    CHECK(!has_param(model.network(), "conv.0.weight"));
+    CHECK(!has_param(model.network(), "stages.0.blocks.0.proj.weight"));
+    CHECK(find_param(model.network(), "stages.1.blocks.0.proj.weight")->shape() ==
+          std::vector<int>({8, 4, 1, 1}));
+    CHECK(find_param(model.network(), "fc.0.weight")->shape() == std::vector<int>({4, 8}));
+    check_io(ctx, model.network(), {2, 1, 8, 8}, {2, 4});
+  }
+
+  {
+    nn::MlpConfig mlp;
+    mlp.input_size = 4;
+    mlp.output_size = 2;
+    bool threw = false;
+    try {
+      nn::ConvResNet model(nn::build_mlp(ctx, mlp, 1));
+      (void)model;
+    } catch (const nn::Error& error) {
+      threw = true;
+      CHECK(std::string(error.what()) == "ConvResNet family");
+    }
+    CHECK(threw);
+  }
 
   std::printf("shapes ok\n");
   return 0;

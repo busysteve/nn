@@ -45,10 +45,25 @@ struct ResNetConfig {
   int output_size = 0;
 };
 
+// One image network that can include a conv+pool trunk, a residual stem and
+// stages, or both. The fully connected head is always present.
+struct ConvResNetConfig {
+  int in_channels = 0;
+  int in_height = 0;
+  int in_width = 0;
+  std::vector<ConvSpec> convs;
+  PoolSpec pool;
+  int stem_channels = 0;
+  std::vector<int> blocks_per_stage;
+  std::vector<int> stage_widths;
+  std::vector<int> fc;
+};
+
 int conv_out_size(int in, int kernel, int stride, int pad);
 
 void validate(const MlpConfig& config);
 void validate(const ConvConfig& config);
 void validate(const ResNetConfig& config);
+void validate(const ConvResNetConfig& config);
 
 }  // namespace nn

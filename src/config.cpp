@@ -69,4 +69,40 @@ void validate(const ResNetConfig& config) {
   }
 }
 
+void validate(const ConvResNetConfig& config) {
+  require_positive(config.in_channels, "in_channels");
+  require_positive(config.in_height, "in_height");
+  require_positive(config.in_width, "in_width");
+  if (config.fc.empty()) bad("fc");
+  for (int units : config.fc) require_positive(units, "fc");
+  if (config.convs.empty() && config.blocks_per_stage.empty()) bad("convs");
+  if (config.stem_channels < 0) bad("stem_channels");
+  if (config.stem_channels > 0 && config.blocks_per_stage.empty()) bad("blocks_per_stage");
+  if (!config.blocks_per_stage.empty() &&
+      config.blocks_per_stage.size() != config.stage_widths.size()) {
+    bad("stage_widths");
+  }
+
+  int height = config.in_height;
+  int width = config.in_width;
+  for (const ConvSpec& spec : config.convs) {
+    require_positive(spec.out_channels, "out_channels");
+    height = conv_out_size(height, spec.kernel, spec.stride, spec.pad);
+    width = conv_out_size(width, spec.kernel, spec.stride, spec.pad);
+    height = conv_out_size(height, config.pool.kernel, config.pool.stride, 0);
+    width = conv_out_size(width, config.pool.kernel, config.pool.stride, 0);
+  }
+  if (config.stem_channels > 0) {
+    height = conv_out_size(height, 3, 1, 1);
+    width = conv_out_size(width, 3, 1, 1);
+  }
+  for (size_t stage = 0; stage < config.blocks_per_stage.size(); ++stage) {
+    require_positive(config.stage_widths[stage], "stage_widths");
+    if (config.blocks_per_stage[stage] < 1) bad("blocks_per_stage");
+    const int first_stride = stage == 0 ? 1 : 2;
+    height = conv_out_size(height, 3, first_stride, 1);
+    width = conv_out_size(width, 3, first_stride, 1);
+  }
+}
+
 }  // namespace nn

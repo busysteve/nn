@@ -14,12 +14,12 @@
 
 namespace nn {
 
-enum class Family : uint32_t { Mlp = 1, Conv = 2, ResNet = 3 };
+enum class Family : uint32_t { Mlp = 1, Conv = 2, ResNet = 3, ConvResNet = 4 };
 
 class Network {
  public:
   Network(Context& ctx, Family family, std::vector<std::unique_ptr<Layer>> layers,
-          std::variant<MlpConfig, ConvConfig, ResNetConfig> config);
+          std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig> config);
   Network(Network&&) noexcept = default;
   Network& operator=(Network&&) noexcept = default;
   Network(const Network&) = delete;
@@ -32,7 +32,9 @@ class Network {
   void eval();
   bool training() const { return training_; }
   Family family() const { return family_; }
-  const std::variant<MlpConfig, ConvConfig, ResNetConfig>& config() const { return config_; }
+  const std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig>& config() const {
+    return config_;
+  }
 
   std::vector<NamedParam> parameters() const;
   std::vector<NamedBuffer> buffers() const;
@@ -46,7 +48,7 @@ class Network {
   Context* ctx_ = nullptr;
   Family family_ = Family::Mlp;
   std::vector<std::unique_ptr<Layer>> layers_;
-  std::variant<MlpConfig, ConvConfig, ResNetConfig> config_;
+  std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig> config_;
   bool training_ = true;
 };
 
