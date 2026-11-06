@@ -15,7 +15,7 @@ void GELU::zero_grad() {}
 
 const Tensor& GELU::forward(const Tensor& input) {
   const std::vector<int>& shape = input.shape();
-  if (shape.size() != 2 && shape.size() != 4) throw Error("GELU rank");
+  if (shape.size() != 2 && shape.size() != 3 && shape.size() != 4) throw Error("GELU rank");
   ensure_tensor(cache_x_, *ctx_, shape);
   ensure_tensor(output_, *ctx_, shape);
   cache_x_->copy_from(input);

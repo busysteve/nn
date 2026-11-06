@@ -17,11 +17,19 @@ struct Split {
 };
 
 Split split_features(const std::vector<int>& shape) {
-  if (shape.size() != 2 && shape.size() != 4) throw Error("SwiGLU rank");
-  if ((shape[1] & 1) != 0) throw Error("SwiGLU size");
+  if (shape.size() != 2 && shape.size() != 3 && shape.size() != 4) throw Error("SwiGLU rank");
   Split split;
-  split.rows = shape[0];
   split.output_shape = shape;
+  if (shape.size() == 3) {
+    // Last dimension, so each (n, t) row is [gate | value]. Rank 2/4 stay on axis 1.
+    if ((shape.back() & 1) != 0) throw Error("SwiGLU size");
+    split.output_shape.back() /= 2;
+    split.rows = static_cast<int>(static_cast<int64_t>(shape[0]) * shape[1]);
+    split.inner = split.output_shape.back();
+    return split;
+  }
+  if ((shape[1] & 1) != 0) throw Error("SwiGLU size");
+  split.rows = shape[0];
   split.output_shape[1] /= 2;
   split.inner = 1;
   for (size_t axis = 1; axis < split.output_shape.size(); ++axis) {

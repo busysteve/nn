@@ -26,6 +26,9 @@ namespace {
 void set_rank(TensorDesc& desc, const std::vector<int>& shape) {
   if (shape.size() == 2) {
     desc.set4(shape[0], 1, 1, shape[1]);
+  } else if (shape.size() == 3) {
+    // (N, T, F) matches NCHW (N, 1, T, F) element order. No copy.
+    desc.set4(shape[0], 1, shape[1], shape[2]);
   } else if (shape.size() == 4) {
     desc.set4(shape[0], shape[1], shape[2], shape[3]);
   } else {

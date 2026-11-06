@@ -7,6 +7,7 @@
 #include "nn/layers/gelu.hpp"
 #include "nn/layers/last_step.hpp"
 #include "nn/layers/linear.hpp"
+#include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
 #include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
@@ -181,6 +182,71 @@ int test_shapes() {
   }
 
   {
+    nn::Linear linear(ctx, 2, 2, false, rng);
+    std::vector<nn::NamedParam> params = linear.parameters();
+    CHECK(params.size() == 1);
+    CHECK(params[0].name == "weight");
+    params[0].value->copy_from_host(std::vector<float>{3.f, 4.f, 5.f, 6.f});
+    linear.zero_grad();
+    nn::Tensor input(ctx, {1, 2});
+    input.copy_from_host(std::vector<float>{1.f, 2.f});
+    expect_close(linear.forward(input).to_host(), {11.f, 17.f}, "linear-nobias");
+    nn::Tensor grad_output(ctx, {1, 2});
+    grad_output.fill(1.f);
+    const nn::Tensor& grad_input = linear.backward(grad_output);
+    CHECK(grad_input.shape() == input.shape());
+    expect_close(grad_input.to_host(), {8.f, 10.f}, "linear-nobias-dx");
+    expect_close(params[0].grad->to_host(), {1.f, 2.f, 1.f, 2.f}, "linear-nobias-dw");
+  }
+
+  {
+    nn::Linear linear(ctx, 2, 2, true, rng);
+    std::vector<nn::NamedParam> params = linear.parameters();
+    CHECK(params.size() == 2);
+    CHECK(params[0].name == "weight");
+    CHECK(params[1].name == "bias");
+    params[0].value->copy_from_host(std::vector<float>{3.f, 4.f, 5.f, 6.f});
+    params[1].value->copy_from_host(std::vector<float>{0.5f, -1.f});
+    linear.zero_grad();
+    nn::Tensor input(ctx, {1, 2, 2});
+    input.copy_from_host(std::vector<float>{1.f, 2.f, 0.f, 1.f});
+    const nn::Tensor& output = linear.forward(input);
+    CHECK(output.shape() == std::vector<int>({1, 2, 2}));
+    expect_close(output.to_host(), {11.5f, 16.f, 4.5f, 5.f}, "linear-rank3");
+    nn::Tensor grad_output(ctx, {1, 2, 2});
+    grad_output.fill(1.f);
+    const nn::Tensor& grad_input = linear.backward(grad_output);
+    CHECK(grad_input.shape() == input.shape());
+    expect_close(grad_input.to_host(), {8.f, 10.f, 8.f, 10.f}, "linear-rank3-dx");
+    expect_close(params[0].grad->to_host(), {1.f, 3.f, 1.f, 3.f}, "linear-rank3-dw");
+    expect_close(params[1].grad->to_host(), {2.f, 2.f}, "linear-rank3-db");
+    nn::Tensor bad_rank(ctx, {1, 2, 2, 2});
+    expect_error([&] { linear.forward(bad_rank); }, "Linear input shape");
+    nn::Tensor bad_grad(ctx, {1, 3, 2});
+    expect_error([&] { linear.backward(bad_grad); }, "Linear backward shape");
+  }
+
+  {
+    nn::Linear linear(ctx, 2, 2, false, rng);
+    std::vector<nn::NamedParam> params = linear.parameters();
+    CHECK(params.size() == 1);
+    CHECK(params[0].name == "weight");
+    params[0].value->copy_from_host(std::vector<float>{3.f, 4.f, 5.f, 6.f});
+    linear.zero_grad();
+    nn::Tensor input(ctx, {2, 2, 2});
+    input.copy_from_host(std::vector<float>{1.f, 2.f, 0.f, 1.f, 1.f, 0.f, -1.f, 1.f});
+    const nn::Tensor& output = linear.forward(input);
+    CHECK(output.shape() == std::vector<int>({2, 2, 2}));
+    expect_close(output.to_host(), {11.f, 17.f, 4.f, 6.f, 3.f, 5.f, 1.f, 1.f}, "linear-rank3-nobias");
+    nn::Tensor grad_output(ctx, output.shape());
+    grad_output.fill(1.f);
+    CHECK(linear.backward(grad_output).shape() == input.shape());
+    expect_close(params[0].grad->to_host(), {1.f, 4.f, 1.f, 4.f}, "linear-rank3-nobias-dw");
+    nn::Tensor bad_features(ctx, {2, 2, 3});
+    expect_error([&] { linear.forward(bad_features); }, "Linear input shape");
+  }
+
+  {
     nn::GELU layer(ctx);
     const std::vector<float> host = {0.f, 1.f, -1.f, 0.5f, -0.25f, 2.f};
     nn::Tensor input(ctx, {2, 3});
@@ -194,7 +260,15 @@ int test_shapes() {
     nn::Tensor rank4(ctx, {1, 2, 2, 2});
     rank4.fill(0.25f);
     CHECK(layer.forward(rank4).shape() == rank4.shape());
-    nn::Tensor bad_rank(ctx, {2, 3, 4});
+    nn::Tensor rank3(ctx, {2, 1, 3});
+    rank3.copy_from_host(host);
+    const nn::Tensor& gelu3 = layer.forward(rank3);
+    CHECK(gelu3.shape() == rank3.shape());
+    expect_close(gelu3.to_host(), want, "gelu-rank3");
+    nn::Tensor grad3(ctx, rank3.shape());
+    grad3.fill(1.f);
+    CHECK(layer.backward(grad3).shape() == rank3.shape());
+    nn::Tensor bad_rank(ctx, {6});
     expect_error([&] { layer.forward(bad_rank); }, "GELU rank");
     nn::GELU fresh(ctx);
     nn::Tensor grad_rank(ctx, {2, 2});
@@ -222,10 +296,59 @@ int test_shapes() {
 
     nn::Tensor odd(ctx, {2, 3});
     expect_error([&] { layer.forward(odd); }, "SwiGLU size");
-    nn::Tensor bad_rank(ctx, {2, 2, 2});
+    nn::Tensor bad_rank(ctx, {4});
     expect_error([&] { layer.forward(bad_rank); }, "SwiGLU rank");
     nn::Tensor bad_grad(ctx, {1, 6});
     expect_error([&] { layer.backward(bad_grad); }, "SwiGLU backward shape");
+
+    // Dim 1 is odd, so a split on axis 1 would throw. Last dim 4 splits to 2.
+    const std::vector<float> seq = {0.5f,  -0.25f, 1.f,  -1.f,  0.25f, 0.75f, -0.5f, 2.f,
+                                    -1.f,  0.5f,   0.f,  1.5f,  1.25f, -0.75f, 0.5f,  -0.25f,
+                                    0.125f, 1.f,   -2.f, 0.25f, -0.5f, 0.5f,  1.5f,  -1.f};
+    nn::Tensor rank3(ctx, {2, 3, 4});
+    rank3.copy_from_host(seq);
+    const nn::Tensor& gated = layer.forward(rank3);
+    CHECK(gated.shape() == std::vector<int>({2, 3, 2}));
+    expect_close(gated.to_host(), swiglu_ref(seq, 6, 2), "swiglu-rank3");
+    nn::Tensor grad3(ctx, {2, 3, 2});
+    grad3.fill(1.f);
+    CHECK(layer.backward(grad3).shape() == rank3.shape());
+    nn::Tensor odd_last(ctx, {2, 2, 3});
+    expect_error([&] { layer.forward(odd_last); }, "SwiGLU size");
+  }
+
+  {
+    nn::ReLU layer(ctx);
+    const std::vector<float> host = {-1.5f, 0.5f, 2.f, -0.25f, 4.f, -3.f};
+    std::vector<float> want(host.size());
+    for (size_t i = 0; i < host.size(); ++i) want[i] = host[i] > 0.f ? host[i] : 0.f;
+    std::vector<float> want_grad(host.size());
+    for (size_t i = 0; i < host.size(); ++i) want_grad[i] = host[i] > 0.f ? 1.f : 0.f;
+
+    nn::Tensor rank2(ctx, {2, 3});
+    rank2.copy_from_host(host);
+    const nn::Tensor& y2 = layer.forward(rank2);
+    CHECK(y2.shape() == rank2.shape());
+    expect_close(y2.to_host(), want, "relu");
+    nn::Tensor grad2(ctx, rank2.shape());
+    grad2.fill(1.f);
+    expect_close(layer.backward(grad2).to_host(), want_grad, "relu-grad");
+
+    nn::Tensor rank3(ctx, {1, 2, 3});
+    rank3.copy_from_host(host);
+    const nn::Tensor& y3 = layer.forward(rank3);
+    CHECK(y3.shape() == rank3.shape());
+    expect_close(y3.to_host(), want, "relu-rank3");
+    nn::Tensor grad3(ctx, rank3.shape());
+    grad3.fill(1.f);
+    CHECK(layer.backward(grad3).shape() == rank3.shape());
+    expect_close(layer.backward(grad3).to_host(), want_grad, "relu-rank3-grad");
+
+    nn::Tensor rank4(ctx, {1, 1, 2, 3});
+    rank4.copy_from_host(host);
+    CHECK(layer.forward(rank4).shape() == rank4.shape());
+    nn::Tensor bad_rank(ctx, {6});
+    expect_error([&] { layer.forward(bad_rank); }, "ReLU rank");
   }
 
   {

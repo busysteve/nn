@@ -118,6 +118,30 @@ int test_gradients() {
     check_layer(layer, input);
   }
 
+  std::printf("grad linear no bias\n");
+  {
+    nn::Linear layer(ctx, 5, 3, false, rng);
+    nn::Tensor input(ctx, {4, 5});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad linear rank3\n");
+  {
+    nn::Linear layer(ctx, 4, 3, true, rng);
+    nn::Tensor input(ctx, {2, 3, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad linear rank3 no bias\n");
+  {
+    nn::Linear layer(ctx, 4, 3, false, rng);
+    nn::Tensor input(ctx, {2, 3, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
   std::printf("grad conv\n");
   {
     nn::Conv2d layer(ctx, 2, 2, 3, 1, 1, true, rng);
@@ -148,6 +172,20 @@ int test_gradients() {
     check_layer(layer, input);
   }
 
+  std::printf("grad relu rank3\n");
+  {
+    nn::ReLU layer(ctx);
+    nn::Tensor input(ctx, {2, 3, 4});
+    std::vector<float> values(static_cast<size_t>(input.numel()));
+    std::uniform_real_distribution<float> dist(0.2f, 1.f);
+    for (size_t i = 0; i < values.size(); ++i) {
+      const float magnitude = dist(rng);
+      values[i] = (i % 2 == 0) ? magnitude : -magnitude;
+    }
+    input.copy_from_host(values);
+    check_layer(layer, input);
+  }
+
   std::printf("grad gelu\n");
   {
     nn::GELU layer(ctx);
@@ -156,10 +194,26 @@ int test_gradients() {
     check_layer(layer, input);
   }
 
+  std::printf("grad gelu rank3\n");
+  {
+    nn::GELU layer(ctx);
+    nn::Tensor input(ctx, {2, 3, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.8f, 0.8f));
+    check_layer(layer, input);
+  }
+
   std::printf("grad swiglu\n");
   {
     nn::SwiGLU layer(ctx);
     nn::Tensor input(ctx, {2, 6});
+    input.copy_from_host(uniform(input.numel(), rng, -0.8f, 0.8f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad swiglu rank3\n");
+  {
+    nn::SwiGLU layer(ctx);
+    nn::Tensor input(ctx, {2, 3, 4});
     input.copy_from_host(uniform(input.numel(), rng, -0.8f, 0.8f));
     check_layer(layer, input);
   }

@@ -207,22 +207,27 @@ Header: `nn/layers/linear.hpp`
 
 ```cpp
 Linear(Context& ctx, int in_features, int out_features, std::mt19937& rng);
+Linear(Context& ctx, int in_features, int out_features, bool use_bias, std::mt19937& rng);
 ```
 
-`in_features` and `out_features` are at least 1. A smaller value throws `Linear size`. The constructor draws `weight` with `kaiming_normal` and fan-in `in_features`, and sets `bias` to zero. Both draws and the zero fill use `rng` only for the weight. The bias fill consumes no random numbers.
+The three-argument constructor calls the four-argument constructor with `use_bias` true.
+
+`in_features` and `out_features` are at least 1. A smaller value throws `Linear size`. The constructor draws `weight` with `kaiming_normal` and fan-in `in_features`. When `use_bias` is true, `bias` starts at zero. The weight draw uses `rng`. The bias fill consumes no random numbers.
 
 | Tensor | Shape | Name |
 |---|---|---|
 | weight | `(out_features, in_features)` | `weight` |
-| bias | `(out_features)` | `bias` |
+| bias, when `use_bias` | `(out_features)` | `bias` |
 
-`forward` takes `(N, in_features)` and returns `(N, out_features)`:
+`forward` takes rank 2 `(N, in_features)` or rank 3 `(N, T, in_features)` and returns `(N, out_features)` or `(N, T, out_features)`:
 
 ```
 y = x * W^T + b
 ```
 
-A rank other than 2, or a feature count other than `in_features`, throws `Linear input shape`. `backward` takes a gradient of shape `(N, out_features)`, returns `(N, in_features)`, and adds into `grad_weight` and `grad_bias`. A mismatched gradient throws `Linear backward shape`.
+When `use_bias` is false, `b` is omitted. Rank 3 keeps shape `(N, T, F)`. The matrix product uses `N * T` rows on the input pointer, with the same leading dimensions as rank 2.
+
+A rank other than 2 or 3, or a feature count other than `in_features`, throws `Linear input shape`. `backward` takes a gradient of the forward output shape, returns the input shape, and adds into `grad_weight` and, when bias is on, `grad_bias`. A mismatched gradient throws `Linear backward shape`.
 
 ### ReLU
 
@@ -232,7 +237,7 @@ Header: `nn/layers/relu.hpp`
 explicit ReLU(Context& ctx);
 ```
 
-No parameters. `forward` and `backward` accept rank 2 or rank 4 and return the same shape. Rank 2 is presented to cuDNN as `(N, 1, 1, F)`. Any other rank throws `ReLU rank`. `backward` requires the gradient shape to match the saved forward output and throws `ReLU backward shape` otherwise. `zero_grad` is empty.
+No parameters. `forward` and `backward` accept rank 2, rank 3, or rank 4 and return the same shape. Rank 2 is presented to cuDNN as `(N, 1, 1, F)`. Rank 3 `(N, T, F)` is presented as `(N, 1, T, F)`. Any other rank throws `ReLU rank`. `backward` requires the gradient shape to match the saved forward output and throws `ReLU backward shape` otherwise. `zero_grad` is empty.
 
 ### GELU
 
@@ -242,7 +247,7 @@ Header: `nn/layers/gelu.hpp`
 explicit GELU(Context& ctx);
 ```
 
-No parameters. `forward` and `backward` accept rank 2 or rank 4 and return the same shape. Any other rank throws `GELU rank`.
+No parameters. `forward` and `backward` accept rank 2, rank 3, or rank 4 and return the same shape. Any other rank throws `GELU rank`.
 
 ```
 GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
@@ -258,14 +263,14 @@ Header: `nn/layers/swiglu.hpp`
 explicit SwiGLU(Context& ctx);
 ```
 
-No parameters. Rank 2 `(N, 2F)` returns `(N, F)`. Rank 4 `(N, 2C, H, W)` returns `(N, C, H, W)`. The split is dimension 1. The first half is the gate `a` and the second half is the value `b`:
+No parameters. Rank 2 `(N, 2F)` returns `(N, F)`. Rank 3 `(N, T, 2F)` returns `(N, T, F)`. Rank 4 `(N, 2C, H, W)` returns `(N, C, H, W)`. Rank 2 and rank 4 split dimension 1. Rank 3 splits the last dimension. The first half is the gate `a` and the second half is the value `b`:
 
 ```
 y = SiLU(a) * b
 SiLU(a) = a * sigmoid(a)
 ```
 
-Any other rank throws `SwiGLU rank`. An odd size on dimension 1 throws `SwiGLU size`. `forward` stores the input. `backward` returns the input shape. A gradient whose shape differs from the forward output throws `SwiGLU backward shape`. `zero_grad` is empty.
+Any other rank throws `SwiGLU rank`. An odd size on the split dimension throws `SwiGLU size`. `forward` stores the input. `backward` returns the input shape. A gradient whose shape differs from the forward output throws `SwiGLU backward shape`. `zero_grad` is empty.
 
 ### RNN
 
