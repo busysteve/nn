@@ -14,6 +14,7 @@
 #include "nn/layers/residual_block.hpp"
 #include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
+#include "nn/layers/transformer_block.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -453,6 +454,173 @@ void check_multi_head_attention(nn::Context& ctx, std::mt19937& rng) {
     input.copy_from_host(std::vector<float>{0.25f, -0.5f});
     expect_mha_matches(layer, input, 1, 1, 2, 2, true, "mha-t1");
     CHECK(layer.forward(input).shape() == std::vector<int>({1, 1, 2}));
+  }
+}
+
+void expect_named(const nn::Layer& layer,
+                   const std::vector<std::pair<std::string, std::vector<int>>>& expected) {
+  const std::vector<nn::NamedParam> params = layer.parameters();
+  CHECK(params.size() == expected.size());
+  for (size_t i = 0; i < expected.size(); ++i) {
+    CHECK(params[i].name == expected[i].first);
+    CHECK(params[i].value->shape() == expected[i].second);
+    CHECK(params[i].grad != nullptr);
+    CHECK(params[i].grad->shape() == expected[i].second);
+  }
+}
+
+nn::TransformerBlockSpec tiny_block_spec() {
+  nn::TransformerBlockSpec spec;
+  spec.d_model = 8;
+  spec.num_heads = 2;
+  spec.d_ff = 16;
+  spec.dropout = 0.f;
+  spec.bias = false;
+  spec.use_rope = false;
+  spec.activation = nn::TransformerActivation::SwiGLU;
+  return spec;
+}
+
+void check_repeated(nn::TransformerBlock& block, nn::Tensor& input) {
+  const std::vector<float> first = block.forward(input).to_host();
+  const std::vector<float> second = block.forward(input).to_host();
+  CHECK(first.size() == static_cast<size_t>(input.numel()));
+  CHECK(first == second);
+  for (float value : first) CHECK(std::isfinite(value));
+}
+
+void check_transformer_block(nn::Context& ctx, std::mt19937& rng) {
+  {
+    nn::TransformerBlockSpec spec = tiny_block_spec();
+    spec.d_model = 0;
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock size");
+    spec = tiny_block_spec();
+    spec.d_model = -1;
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock size");
+    spec = tiny_block_spec();
+    spec.num_heads = 0;
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock size");
+    spec = tiny_block_spec();
+    spec.num_heads = -1;
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock size");
+    spec = tiny_block_spec();
+    spec.num_heads = 3;
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock size");
+    spec = tiny_block_spec();
+    spec.d_ff = 0;
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock size");
+    spec = tiny_block_spec();
+    spec.d_ff = -4;
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock size");
+    spec = tiny_block_spec();
+    spec.dropout = 1.f;
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock dropout");
+    spec = tiny_block_spec();
+    spec.dropout = -0.1f;
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock dropout");
+    spec = tiny_block_spec();
+    spec.dropout = std::nanf("");
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock dropout");
+    spec = tiny_block_spec();
+    spec.activation = static_cast<nn::TransformerActivation>(0);
+    expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock activation");
+    spec = tiny_block_spec();
+    spec.use_rope = true;
+    expect_invalid([&] { nn::TransformerBlock(ctx, spec, rng); }, "use_rope");
+  }
+
+  nn::Tensor input(ctx, {1, 3, 8});
+  input.fill(0.1f);
+  {
+    nn::TransformerBlock block(ctx, tiny_block_spec(), rng);
+    const std::vector<std::pair<std::string, std::vector<int>>> names = {
+        {"ln1.weight", {8}},
+        {"ln1.bias", {8}},
+        {"attn.q.weight", {8, 8}},
+        {"attn.k.weight", {8, 8}},
+        {"attn.v.weight", {8, 8}},
+        {"attn.out.weight", {8, 8}},
+        {"ln2.weight", {8}},
+        {"ln2.bias", {8}},
+        {"fc1.weight", {32, 8}},
+        {"fc2.weight", {8, 16}},
+    };
+    expect_named(block, names);
+    CHECK(block.attn().parameters()[0].name == "q.weight");
+    CHECK(block.attn().parameters()[0].value == block.parameters()[2].value);
+    const nn::TransformerBlock& cref = block;
+    CHECK(&cref.attn() == &block.attn());
+    const nn::Tensor& output = block.forward(input);
+    CHECK(output.shape() == std::vector<int>({1, 3, 8}));
+    for (float value : output.to_host()) CHECK(std::isfinite(value));
+    check_repeated(block, input);
+    nn::Tensor grad(ctx, output.shape());
+    grad.fill(1.f);
+    CHECK(block.backward(grad).shape() == input.shape());
+    block.zero_grad();
+    for (const nn::NamedParam& param : block.parameters()) {
+      for (float value : param.grad->to_host()) CHECK(value == 0.f);
+    }
+    nn::Tensor bad_rank(ctx, {3, 8});
+    expect_error([&] { block.forward(bad_rank); }, "TransformerBlock input shape");
+    nn::Tensor bad_last(ctx, {1, 3, 4});
+    expect_error([&] { block.forward(bad_last); }, "TransformerBlock input shape");
+    block.forward(input);
+    nn::Tensor bad_grad(ctx, {1, 2, 8});
+    expect_error([&] { block.backward(bad_grad); }, "TransformerBlock backward shape");
+    nn::TransformerBlock fresh(ctx, tiny_block_spec(), rng);
+    expect_error([&] { fresh.backward(grad); }, "TransformerBlock backward shape");
+  }
+
+  {
+    nn::TransformerBlockSpec spec = tiny_block_spec();
+    spec.bias = true;
+    nn::TransformerBlock block(ctx, spec, rng);
+    expect_named(block, {{"ln1.weight", {8}},
+                         {"ln1.bias", {8}},
+                         {"attn.q.weight", {8, 8}},
+                         {"attn.q.bias", {8}},
+                         {"attn.k.weight", {8, 8}},
+                         {"attn.k.bias", {8}},
+                         {"attn.v.weight", {8, 8}},
+                         {"attn.v.bias", {8}},
+                         {"attn.out.weight", {8, 8}},
+                         {"attn.out.bias", {8}},
+                         {"ln2.weight", {8}},
+                         {"ln2.bias", {8}},
+                         {"fc1.weight", {32, 8}},
+                         {"fc1.bias", {32}},
+                         {"fc2.weight", {8, 16}},
+                         {"fc2.bias", {8}}});
+    CHECK(block.forward(input).shape() == std::vector<int>({1, 3, 8}));
+  }
+
+  {
+    nn::TransformerBlockSpec spec = tiny_block_spec();
+    spec.activation = nn::TransformerActivation::Gelu;
+    nn::TransformerBlock block(ctx, spec, rng);
+    expect_named(block, {{"ln1.weight", {8}},
+                         {"ln1.bias", {8}},
+                         {"attn.q.weight", {8, 8}},
+                         {"attn.k.weight", {8, 8}},
+                         {"attn.v.weight", {8, 8}},
+                         {"attn.out.weight", {8, 8}},
+                         {"ln2.weight", {8}},
+                         {"ln2.bias", {8}},
+                         {"fc1.weight", {16, 8}},
+                         {"fc2.weight", {8, 16}}});
+    CHECK(block.forward(input).shape() == std::vector<int>({1, 3, 8}));
+    for (float value : block.forward(input).to_host()) CHECK(std::isfinite(value));
+  }
+
+  {
+    nn::TransformerBlockSpec spec = tiny_block_spec();
+    spec.dropout = 0.5f;
+    nn::TransformerBlock block(ctx, spec, rng);
+    block.set_training(true);
+    block.forward(input);
+    block.set_training(false);
+    check_repeated(block, input);
   }
 }
 
@@ -1193,6 +1361,7 @@ int test_shapes() {
   }
 
   check_multi_head_attention(ctx, rng);
+  check_transformer_block(ctx, rng);
 
   std::printf("shapes ok\n");
   return 0;

@@ -39,6 +39,7 @@ add_library(nn STATIC
   src/layer_norm.cu
   src/dropout.cpp
   src/multi_head_attention.cu
+  src/transformer_block.cpp
   src/rnn.cpp
   src/last_step.cpp
   src/conv2d.cpp

@@ -176,7 +176,7 @@ struct NamedBuffer {
 
 A parameter is a trainable tensor plus its gradient. A buffer is state that is saved and restored and is left alone by `zero_grad` and by `Sgd`. `batches` points at the batch-norm counter shared by that layer's `running_mean` and `running_var`.
 
-`Layer::parameters()` returns names local to the layer, such as `weight` and `bias`. `Network::parameters()` prefixes the layer name. A layer named `fc.0` contributes `fc.0.weight` and `fc.0.bias`. An empty layer name contributes the local name unchanged. `ResidualBlock` prefixes its children first, so a block named `stages.0.blocks.1` contributes `stages.0.blocks.1.conv1.weight`.
+`Layer::parameters()` returns names local to the layer, such as `weight` and `bias`. `Network::parameters()` prefixes the layer name. A layer named `fc.0` contributes `fc.0.weight` and `fc.0.bias`. An empty layer name contributes the local name unchanged. `ResidualBlock` prefixes its children first, so a block named `stages.0.blocks.1` contributes `stages.0.blocks.1.conv1.weight`. `TransformerBlock` prefixes the same way (`ln1.`, `attn.`, `ln2.`, `fc1.`, `fc2.`).
 
 ## Layer
 
@@ -197,7 +197,7 @@ class Layer {
 };
 ```
 
-`Layer` is the abstract base. Construct a concrete layer with a `Context`, then call `forward` and `backward` yourself or hand ownership to a `Network` with `std::unique_ptr<Layer>`. `set_name` before the network is built. `buffers()` defaults to an empty list. `set_training` defaults to a no-op. `BatchNorm2d`, `Dropout`, and `ResidualBlock` honor it. `LayerNorm` ignores it: train and eval use the same math.
+`Layer` is the abstract base. Construct a concrete layer with a `Context`, then call `forward` and `backward` yourself or hand ownership to a `Network` with `std::unique_ptr<Layer>`. `set_name` before the network is built. `buffers()` defaults to an empty list. `set_training` defaults to a no-op. `BatchNorm2d`, `Dropout`, `ResidualBlock`, and `TransformerBlock` honor it. `LayerNorm` ignores it: train and eval use the same math.
 
 `backward` reads the activation saved by the matching `forward`. Call `forward` on that layer before `backward`.
 
@@ -426,6 +426,36 @@ The layer owns four `Linear` children, each `d_model` to `d_model`, constructed 
 `forward` takes `(N, T, d_model)` and returns the same shape. `Dh = d_model / num_heads`. Projections are the child linears. Attention scores are `Q K^T / sqrt(Dh)` with shape `(N, num_heads, T, T)`. When `causal` is true, entries with key index `j > i` are set to `-1e9` before the softmax over the last dimension. The attention output is projected by `out`. A rank other than 3, or a last dimension other than `d_model`, throws `MultiHeadAttention input shape`.
 
 `backward` returns the input shape and adds into each child's `grad_weight` and, when bias is on, `grad_bias`. A missing forward or a mismatched gradient throws `MultiHeadAttention backward shape`. `zero_grad` clears every child.
+
+### TransformerBlock
+
+Header: `nn/layers/transformer_block.hpp`
+
+```cpp
+enum class TransformerActivation : uint32_t { Gelu = 1, SwiGLU = 2 };
+
+struct TransformerBlockSpec {
+  int d_model = 0;
+  int num_heads = 0;
+  int d_ff = 0;
+  float dropout = 0.f;
+  bool bias = false;
+  bool use_rope = false;
+  TransformerActivation activation = TransformerActivation::SwiGLU;
+};
+
+TransformerBlock(Context& ctx, const TransformerBlockSpec& spec, std::mt19937& rng);
+MultiHeadAttention& attn();
+```
+
+Pre-norm block. There is no fourth constructor argument. `d_model`, `num_heads`, and `d_ff` are at least 1, and `d_model` must be divisible by `num_heads` (`TransformerBlock size`). `dropout` is in `[0, 1)` (`TransformerBlock dropout`). Any other `activation` throws `TransformerBlock activation`. `use_rope` is passed through to causal `MultiHeadAttention`; `true` throws `std::invalid_argument` with message `use_rope`.
+
+```
+h = x + drop1(mha(ln1(x)))
+y = h + drop2(ffn(ln2(h)))
+```
+
+`d_ff` is the width after the gate. GELU is `Linear(d_model → d_ff)`, `GELU`, `Linear(d_ff → d_model)`. SwiGLU is `Linear(d_model → 2*d_ff)`, `SwiGLU`, `Linear(d_ff → d_model)`. Both linears use `bias`. `attn()` is the owned attention layer. `set_training` reaches both dropouts. Child parameter prefixes are `ln1.`, `attn.`, `drop1.`, `ln2.`, `fc1.`, `fc2.`. Dropout and the activation have no parameters. `forward` takes `(N, T, d_model)` and returns the same shape. A rank other than 3, or a last dimension other than `d_model`, throws `TransformerBlock input shape`. A missing forward or a mismatched gradient throws `TransformerBlock backward shape`.
 
 ### Flatten
 

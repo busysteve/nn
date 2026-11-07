@@ -13,6 +13,7 @@
 #include "nn/layers/residual_block.hpp"
 #include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
+#include "nn/layers/transformer_block.hpp"
 #include "nn/loss.hpp"
 
 #include <cmath>
@@ -363,6 +364,21 @@ int test_gradients() {
   {
     nn::MultiHeadAttention layer(ctx, 4, 2, false, false, false, rng);
     nn::Tensor input(ctx, {1, 3, 4});
+    input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad transformer swiglu\n");
+  {
+    nn::TransformerBlockSpec spec;
+    spec.d_model = 8;
+    spec.num_heads = 2;
+    spec.d_ff = 16;
+    spec.dropout = 0.f;
+    spec.bias = false;
+    spec.activation = nn::TransformerActivation::SwiGLU;
+    nn::TransformerBlock layer(ctx, spec, rng);
+    nn::Tensor input(ctx, {1, 3, 8});
     input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
     check_layer(layer, input);
   }
