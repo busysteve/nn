@@ -54,6 +54,7 @@ add_library(nn STATIC
   src/network.cpp
   src/optim.cpp
   src/sgd.cu
+  src/adamw.cu
   src/loss.cu
   src/checkpoint.cpp
   src/builders.cpp

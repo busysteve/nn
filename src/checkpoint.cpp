@@ -19,6 +19,9 @@ namespace {
 
 constexpr uint32_t kMagic = 0x314E4E43u;
 constexpr uint32_t kVersion = 1u;
+constexpr uint32_t kVersionAdamW = 2u;
+constexpr uint32_t kKindSgd = 1u;
+constexpr uint32_t kKindAdamW = 2u;
 constexpr uint32_t kFloat32 = 1u;
 
 class ByteWriter {
@@ -145,6 +148,20 @@ struct ParsedOpt {
   std::vector<std::vector<float>> velocity;
 };
 
+struct ParsedAdamGroup {
+  float weight_decay = 0.f;
+  std::vector<std::vector<float>> m;
+  std::vector<std::vector<float>> v;
+};
+
+struct ParsedAdamW {
+  float lr = 0.f;
+  float beta1 = 0.f;
+  float beta2 = 0.f;
+  float eps = 0.f;
+  std::vector<ParsedAdamGroup> groups;
+};
+
 struct Header {
   uint32_t version = 0;
   uint32_t family = 0;
@@ -194,7 +211,7 @@ std::vector<uint8_t> read_file(const std::filesystem::path& path) {
   return bytes;
 }
 
-Header read_header(ByteReader& reader, uint32_t max_version = kVersion) {
+Header read_header(ByteReader& reader, uint32_t max_version = kVersionAdamW) {
   const uint32_t magic = reader.u32();
   if (magic != kMagic) throw Error("bad checkpoint magic");
   const uint32_t version = reader.u32();
@@ -394,14 +411,49 @@ ParsedOpt read_opt(ByteReader& reader, const std::vector<ParsedParam>& params) {
   return opt;
 }
 
+ParsedAdamW read_adamw(ByteReader& reader, const std::vector<ParsedParam>& params) {
+  ParsedAdamW opt;
+  opt.lr = reader.f32();
+  opt.beta1 = reader.f32();
+  opt.beta2 = reader.f32();
+  opt.eps = reader.f32();
+  const uint32_t group_count = reader.u32();
+  if (reader.u32() != 0) throw Error("optimizer state mismatch");
+  if (group_count == 0 || group_count > 1000000u) throw Error("optimizer state mismatch");
+  opt.groups.resize(group_count);
+  size_t seen = 0;
+  for (uint32_t g = 0; g < group_count; ++g) {
+    opt.groups[g].weight_decay = reader.f32();
+    const uint32_t param_count = reader.u32();
+    if (param_count == 0 || param_count > 1000000u) throw Error("optimizer state mismatch");
+    if (seen + param_count > params.size()) throw Error("optimizer state mismatch");
+    opt.groups[g].m.resize(param_count);
+    opt.groups[g].v.resize(param_count);
+    for (uint32_t i = 0; i < param_count; ++i) {
+      const uint32_t numel_m = reader.u32();
+      if (reader.u32() != 0) throw Error("optimizer state mismatch");
+      if (seen >= params.size() || numel_m != params[seen].data.size()) {
+        throw Error("optimizer state mismatch");
+      }
+      opt.groups[g].m[i] = reader.f32s(numel_m);
+      reader.pad8();
+      const uint32_t numel_v = reader.u32();
+      if (reader.u32() != 0 || numel_v != numel_m) throw Error("optimizer state mismatch");
+      opt.groups[g].v[i] = reader.f32s(numel_v);
+      reader.pad8();
+      ++seen;
+    }
+  }
+  if (seen != params.size()) throw Error("optimizer state mismatch");
+  return opt;
+}
+
 void require_match(const ParsedParam& parsed, const NamedParam& param) {
   if (parsed.name != param.name || parsed.shape != param.value->shape() ||
       static_cast<int64_t>(parsed.data.size()) != param.value->numel()) {
     throw Error("checkpoint tensor mismatch: " + parsed.name);
   }
 }
-
-constexpr uint32_t kSgdKind = 1u;
 
 void write_transformer_config(ByteWriter& writer, const TransformerConfig& config) {
   writer.i32(config.vocab_size);
@@ -484,29 +536,84 @@ void commit_checkpoint(const std::filesystem::path& path, const std::vector<uint
   }
 }
 
-}  // namespace
+void require_owned_by(const Network& network, const std::vector<NamedParam>& params) {
+  const std::vector<NamedParam> mine = network.parameters();
+  if (mine.size() != params.size()) throw Error("optimizer does not belong to this network");
+  for (size_t i = 0; i < mine.size(); ++i) {
+    if (mine[i].value != params[i].value) throw Error("optimizer does not belong to this network");
+  }
+}
 
-void Network::save(const std::filesystem::path& path, const Sgd* optimizer) const {
-  if (optimizer) {
-    const std::vector<NamedParam> mine = parameters();
-    const std::vector<NamedParam>& theirs = optimizer->params();
-    if (mine.size() != theirs.size()) throw Error("optimizer does not belong to this network");
-    for (size_t i = 0; i < mine.size(); ++i) {
-      if (mine[i].value != theirs[i].value) throw Error("optimizer does not belong to this network");
+std::vector<NamedParam> flat_params(const AdamW& optimizer) {
+  std::vector<NamedParam> params;
+  for (const AdamWGroup& group : optimizer.groups()) {
+    params.insert(params.end(), group.params.begin(), group.params.end());
+  }
+  return params;
+}
+
+void write_optimizer_sgd(ByteWriter& writer, const Sgd& optimizer) {
+  writer.f32(optimizer.learning_rate());
+  writer.f32(optimizer.momentum());
+  writer.u32(static_cast<uint32_t>(optimizer.velocity().size()));
+  writer.u32(0);
+  for (const Tensor& velocity : optimizer.velocity()) {
+    const std::vector<float> values = velocity.to_host();
+    writer.u32(static_cast<uint32_t>(values.size()));
+    writer.u32(0);
+    writer.f32s(values);
+    writer.pad8();
+  }
+}
+
+void write_optimizer_adamw(ByteWriter& writer, const AdamW& optimizer) {
+  writer.u32(kKindAdamW);
+  writer.f32(optimizer.learning_rate());
+  writer.f32(optimizer.beta1());
+  writer.f32(optimizer.beta2());
+  writer.f32(optimizer.eps());
+  const std::vector<AdamWGroup>& groups = optimizer.groups();
+  writer.u32(static_cast<uint32_t>(groups.size()));
+  writer.u32(0);
+  size_t flat = 0;
+  for (const AdamWGroup& group : groups) {
+    writer.f32(group.weight_decay);
+    writer.u32(static_cast<uint32_t>(group.params.size()));
+    for (const NamedParam& param : group.params) {
+      if (flat >= optimizer.m().size() || flat >= optimizer.v().size() || param.value == nullptr) {
+        throw Error("optimizer state mismatch");
+      }
+      const std::vector<float> m = optimizer.m()[flat].to_host();
+      const std::vector<float> v = optimizer.v()[flat].to_host();
+      if (m.size() != static_cast<size_t>(param.value->numel()) || v.size() != m.size()) {
+        throw Error("optimizer state mismatch");
+      }
+      writer.u32(static_cast<uint32_t>(m.size()));
+      writer.u32(0);
+      writer.f32s(m);
+      writer.pad8();
+      writer.u32(static_cast<uint32_t>(v.size()));
+      writer.u32(0);
+      writer.f32s(v);
+      writer.pad8();
+      ++flat;
     }
   }
-  ctx_->synchronize();
-  const std::vector<NamedParam> params = parameters();
-  const std::vector<NamedBuffer> buffers = this->buffers();
+  if (flat != optimizer.m().size() || flat != optimizer.v().size()) throw Error("optimizer state mismatch");
+}
+
+void write_model(ByteWriter& writer, const Network& network, uint32_t version, uint64_t step,
+                 uint32_t optimizer_present) {
+  const std::vector<NamedParam> params = network.parameters();
+  const std::vector<NamedBuffer> buffers = network.buffers();
   if (buffers.size() % 2 != 0) throw Error("checkpoint tensor mismatch: batch-norm buffers");
 
-  ByteWriter writer;
   writer.u32(kMagic);
-  writer.u32(kVersion);
-  writer.u32(static_cast<uint32_t>(family_));
-  writer.u32(training_ ? 1u : 0u);
-  writer.u64(optimizer ? optimizer->step_count() : 0);
-  writer.u32(optimizer ? 1u : 0u);
+  writer.u32(version);
+  writer.u32(static_cast<uint32_t>(network.family()));
+  writer.u32(network.training() ? 1u : 0u);
+  writer.u64(step);
+  writer.u32(optimizer_present);
   writer.u32(0);
 
   std::visit(
@@ -575,12 +682,32 @@ void Network::save(const std::filesystem::path& path, const Sgd* optimizer) cons
           write_transformer_config(writer, config);
         }
       },
-      config_);
+      network.config());
   writer.pad8();
 
   write_params(writer, params);
   write_bn(writer, buffers);
-  if (optimizer) write_sgd(writer, *optimizer);
+}
+
+}  // namespace
+
+void Network::save(const std::filesystem::path& path, const Sgd* optimizer) const {
+  if (optimizer) require_owned_by(*this, optimizer->params());
+  ctx_->synchronize();
+  ByteWriter writer;
+  write_model(writer, *this, kVersion, optimizer ? optimizer->step_count() : 0, optimizer ? 1u : 0u);
+  if (optimizer) write_optimizer_sgd(writer, *optimizer);
+  commit_checkpoint(path, writer.bytes());
+}
+
+void Network::save(const std::filesystem::path& path, const AdamW* optimizer) const {
+  // Resume splits parameters() by stored group sizes, so groups must be that order.
+  if (optimizer) require_owned_by(*this, flat_params(*optimizer));
+  ctx_->synchronize();
+  ByteWriter writer;
+  write_model(writer, *this, kVersionAdamW, optimizer ? optimizer->step_count() : 0,
+              optimizer ? 1u : 0u);
+  if (optimizer) write_optimizer_adamw(writer, *optimizer);
   commit_checkpoint(path, writer.bytes());
 }
 
@@ -591,9 +718,19 @@ Network::Loaded Network::load(Context& ctx, const std::filesystem::path& path, L
   uint32_t param_count = 0;
   const std::vector<ParsedParam> parsed_params = read_params(reader, &param_count);
   const std::vector<ParsedBn> parsed_bn = read_bn(reader);
-  std::optional<ParsedOpt> parsed_opt;
-  if (header.optimizer_present) parsed_opt = read_opt(reader, parsed_params);
-  if (mode == LoadMode::Resume && !parsed_opt) throw Error("optimizer block missing");
+  std::optional<ParsedOpt> parsed_sgd;
+  std::optional<ParsedAdamW> parsed_adamw;
+  if (header.optimizer_present) {
+    if (header.version == kVersion) {
+      parsed_sgd = read_opt(reader, parsed_params);
+    } else {
+      const uint32_t kind = reader.u32();
+      if (kind == kKindSgd) parsed_sgd = read_opt(reader, parsed_params);
+      else if (kind == kKindAdamW) parsed_adamw = read_adamw(reader, parsed_params);
+      else throw Error("unsupported optimizer kind " + std::to_string(kind));
+    }
+  }
+  if (mode == LoadMode::Resume && !parsed_sgd && !parsed_adamw) throw Error("optimizer block missing");
 
   Network network = std::visit(
       [&](const auto& cfg) -> Network {
@@ -635,14 +772,38 @@ Network::Loaded Network::load(Context& ctx, const std::filesystem::path& path, L
   if (header.training) network.train();
   else network.eval();
 
-  Loaded loaded{std::move(network), std::nullopt, header.step};
-  if (mode == LoadMode::Resume) {
-    Sgd optimizer(loaded.network.parameters(), parsed_opt->learning_rate, parsed_opt->momentum);
-    for (size_t i = 0; i < parsed_opt->velocity.size(); ++i) {
-      optimizer.velocity()[i].copy_from_host(parsed_opt->velocity[i]);
+  Loaded loaded{std::move(network), std::nullopt, std::nullopt, header.step};
+  if (mode == LoadMode::Resume && parsed_sgd) {
+    Sgd optimizer(loaded.network.parameters(), parsed_sgd->learning_rate, parsed_sgd->momentum);
+    for (size_t i = 0; i < parsed_sgd->velocity.size(); ++i) {
+      optimizer.velocity()[i].copy_from_host(parsed_sgd->velocity[i]);
     }
     optimizer.set_step_count(header.step);
     loaded.optimizer = std::move(optimizer);
+  } else if (mode == LoadMode::Resume && parsed_adamw) {
+    const std::vector<NamedParam> live = loaded.network.parameters();
+    std::vector<AdamWGroup> groups;
+    groups.reserve(parsed_adamw->groups.size());
+    size_t cursor = 0;
+    for (const ParsedAdamGroup& group : parsed_adamw->groups) {
+      AdamWGroup built;
+      built.weight_decay = group.weight_decay;
+      built.params.reserve(group.m.size());
+      for (size_t i = 0; i < group.m.size(); ++i) built.params.push_back(live[cursor + i]);
+      cursor += group.m.size();
+      groups.push_back(std::move(built));
+    }
+    AdamW adamw(std::move(groups), parsed_adamw->lr, parsed_adamw->beta1, parsed_adamw->beta2,
+                parsed_adamw->eps);
+    size_t flat = 0;
+    for (const ParsedAdamGroup& group : parsed_adamw->groups) {
+      for (size_t i = 0; i < group.m.size(); ++i, ++flat) {
+        adamw.m()[flat].copy_from_host(group.m[i]);
+        adamw.v()[flat].copy_from_host(group.v[i]);
+      }
+    }
+    adamw.set_step_count(header.step);
+    loaded.adamw = std::move(adamw);
   }
   ctx.synchronize();
   return loaded;
@@ -674,7 +835,7 @@ void Transformer::save(const std::filesystem::path& path, const Sgd* optimizer) 
   write_params(writer, params);
   write_bn(writer, {});
   if (optimizer) {
-    writer.u32(kSgdKind);
+    writer.u32(kKindSgd);
     write_sgd(writer, *optimizer);
   }
   commit_checkpoint(path, writer.bytes());
@@ -694,7 +855,7 @@ Transformer::Loaded Transformer::load(Context& ctx, const std::filesystem::path&
   if (header.optimizer_present) {
     if (header.version == 2u) {
       const uint32_t kind = reader.u32();
-      if (kind != kSgdKind) throw Error("unsupported optimizer kind");
+      if (kind != kKindSgd) throw Error("unsupported optimizer kind");
     }
     parsed_opt = read_opt(reader, parsed_params);
   }

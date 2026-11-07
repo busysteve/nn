@@ -17,14 +17,18 @@
 #include "nn/layers/swiglu.hpp"
 #include "nn/layers/transformer_block.hpp"
 #include "nn/loss.hpp"
+#include "nn/optim.hpp"
 #include "nn/transformer.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -625,6 +629,178 @@ int test_gradients() {
     nn::LossResult zero_result = nn::sequence_cross_entropy(ctx, logits, ignored);
     CHECK(zero_result.loss == 0.f);
     for (float value : zero_result.grad_logits.to_host()) CHECK(value == 0.f);
+  }
+
+  std::printf("adamw step\n");
+  {
+    auto expect_invalid = [](const std::function<void()>& call) {
+      bool threw = false;
+      try {
+        call();
+      } catch (const std::invalid_argument&) {
+        threw = true;
+      }
+      CHECK(threw);
+    };
+    expect_invalid([] { nn::AdamW(std::vector<nn::AdamWGroup>{}, 0.1f, 0.9f, 0.999f, 1e-8f); });
+    nn::AdamWGroup empty;
+    expect_invalid([&] { nn::AdamW(std::vector<nn::AdamWGroup>{empty}, 0.1f, 0.9f, 0.999f, 1e-8f); });
+    expect_invalid([] {
+      nn::AdamW(std::vector<nn::NamedParam>{}, 0.1f, 0.9f, 0.999f, 1e-8f, 0.f);
+    });
+
+    nn::Tensor weight(ctx, {2});
+    nn::Tensor grad_weight(ctx, {2});
+    nn::Tensor bias(ctx, {1});
+    nn::Tensor grad_bias(ctx, {1});
+    const std::vector<float> w0{1.5f, -0.25f};
+    const std::vector<float> gw{0.1f, -0.2f};
+    const std::vector<float> b0{0.5f};
+    const std::vector<float> gb{0.3f};
+    weight.copy_from_host(w0);
+    grad_weight.copy_from_host(gw);
+    bias.copy_from_host(b0);
+    grad_bias.copy_from_host(gb);
+    nn::NamedParam weight_param{"weight", &weight, &grad_weight};
+    nn::NamedParam bias_param{"bias", &bias, &grad_bias};
+    expect_invalid([&] {
+      nn::NamedParam missing{"weight", &weight, nullptr};
+      nn::AdamW({missing}, 0.1f, 0.9f, 0.999f, 1e-8f, 0.f);
+    });
+    expect_invalid([&] {
+      nn::Tensor wide(ctx, {3});
+      nn::NamedParam mismatch{"weight", &weight, &wide};
+      nn::AdamW({mismatch}, 0.1f, 0.9f, 0.999f, 1e-8f, 0.f);
+    });
+    expect_invalid([&] {
+      nn::AdamWGroup twice;
+      twice.params = {weight_param, weight_param};
+      nn::AdamW(std::vector<nn::AdamWGroup>{twice}, 0.1f, 0.9f, 0.999f, 1e-8f);
+    });
+    expect_invalid([&] {
+      nn::AdamW({weight_param}, std::numeric_limits<float>::quiet_NaN(), 0.9f, 0.999f, 1e-8f, 0.f);
+    });
+    expect_invalid([&] {
+      nn::AdamWGroup group;
+      group.params = {weight_param};
+      group.weight_decay = std::numeric_limits<float>::infinity();
+      nn::AdamW(std::vector<nn::AdamWGroup>{group}, 0.1f, 0.9f, 0.999f, 1e-8f);
+    });
+
+    nn::AdamWGroup decay;
+    decay.weight_decay = 0.1f;
+    decay.params = {weight_param};
+    nn::AdamWGroup plain;
+    plain.weight_decay = 0.f;
+    plain.params = {bias_param};
+    const float lr = 0.01f;
+    const float beta1 = 0.9f;
+    const float beta2 = 0.999f;
+    const float eps = 1e-8f;
+    nn::AdamW opt(std::vector<nn::AdamWGroup>{decay, plain}, lr, beta1, beta2, eps);
+    CHECK(opt.step_count() == 0);
+    std::vector<float> w = w0;
+    std::vector<float> b = b0;
+    std::vector<float> mw(w.size(), 0.f);
+    std::vector<float> vw(w.size(), 0.f);
+    std::vector<float> mb(b.size(), 0.f);
+    std::vector<float> vb(b.size(), 0.f);
+    auto reference = [](std::vector<float>& param, std::vector<float>& m, std::vector<float>& v,
+                        const std::vector<float>& grad, float step_lr, float step_beta1, float step_beta2,
+                        float step_eps, float wd, float bc1, float bc2) {
+      for (size_t i = 0; i < param.size(); ++i) {
+        const float g = grad[i];
+        const float m_new = step_beta1 * m[i] + (1.f - step_beta1) * g;
+        const float v_new = step_beta2 * v[i] + (1.f - step_beta2) * g * g;
+        m[i] = m_new;
+        v[i] = v_new;
+        const float m_hat = m_new / bc1;
+        const float v_hat = v_new / bc2;
+        const float update = m_hat / (std::sqrt(v_hat) + step_eps) + wd * param[i];
+        param[i] = param[i] - step_lr * update;
+      }
+    };
+    for (int step = 1; step <= 2; ++step) {
+      opt.step();
+      const float bc1 =
+          1.f - static_cast<float>(std::pow(static_cast<double>(beta1), static_cast<double>(step)));
+      const float bc2 =
+          1.f - static_cast<float>(std::pow(static_cast<double>(beta2), static_cast<double>(step)));
+      reference(w, mw, vw, gw, lr, beta1, beta2, eps, 0.1f, bc1, bc2);
+      reference(b, mb, vb, gb, lr, beta1, beta2, eps, 0.f, bc1, bc2);
+    }
+    CHECK(opt.step_count() == 2);
+    CHECK(opt.learning_rate() == lr);
+    CHECK(opt.beta1() == beta1);
+    CHECK(opt.beta2() == beta2);
+    CHECK(opt.eps() == eps);
+    const std::vector<float> got_w = weight.to_host();
+    const std::vector<float> got_b = bias.to_host();
+    const std::vector<float> got_mw = opt.m()[0].to_host();
+    const std::vector<float> got_mb = opt.m()[1].to_host();
+    const std::vector<float> got_vw = opt.v()[0].to_host();
+    const std::vector<float> got_vb = opt.v()[1].to_host();
+    CHECK(got_w.size() == w.size());
+    CHECK(got_b.size() == b.size());
+    for (size_t i = 0; i < w.size(); ++i) {
+      check_close(w[i], got_w[i], 1e-5, 1e-6, "adamw weight", i);
+      check_close(mw[i], got_mw[i], 1e-5, 1e-6, "adamw m", i);
+      check_close(vw[i], got_vw[i], 1e-5, 1e-6, "adamw v", i);
+    }
+    check_close(b[0], got_b[0], 1e-5, 1e-6, "adamw bias", 0);
+    check_close(mb[0], got_mb[0], 1e-5, 1e-6, "adamw m bias", 0);
+    check_close(vb[0], got_vb[0], 1e-5, 1e-6, "adamw v bias", 0);
+    CHECK(got_w[0] != w0[0]);
+    opt.set_learning_rate(0.02f);
+    CHECK(opt.learning_rate() == 0.02f);
+    expect_invalid([&] { opt.set_learning_rate(std::numeric_limits<float>::quiet_NaN()); });
+  }
+
+  std::printf("clip grad norm\n");
+  {
+    CHECK(nn::clip_grad_norm({}, 1.f) == 0.f);
+    nn::Tensor grad(ctx, {2});
+    nn::Tensor skipped(ctx, {1});
+    grad.copy_from_host({3.f, 4.f});
+    skipped.copy_from_host({12.f});
+    nn::NamedParam kept{"grad", &grad, &grad};
+    nn::NamedParam ignored{"skip", &skipped, nullptr};
+    const float open = nn::clip_grad_norm({kept, ignored}, 10.f);
+    CHECK(open == 5.f);
+    const std::vector<float> unchanged = grad.to_host();
+    CHECK(unchanged.size() == 2);
+    CHECK(unchanged[0] == 3.f);
+    CHECK(unchanged[1] == 4.f);
+    CHECK(skipped.to_host()[0] == 12.f);
+
+    nn::Tensor left(ctx, {1});
+    nn::Tensor right(ctx, {1});
+    left.copy_from_host({3.f});
+    right.copy_from_host({4.f});
+    nn::NamedParam p0{"left", &left, &left};
+    nn::NamedParam p1{"right", &right, &right};
+    const float max_norm = 2.5f;
+    const float clipped = nn::clip_grad_norm({p0, ignored, p1}, max_norm);
+    CHECK(clipped == 5.f);
+    const float scale = std::min(1.f, max_norm / (5.f + 1e-6f));
+    CHECK(left.to_host()[0] == 3.f * scale);
+    CHECK(right.to_host()[0] == 4.f * scale);
+    CHECK(skipped.to_host()[0] == 12.f);
+
+    bool threw = false;
+    try {
+      nn::clip_grad_norm({kept}, 0.f);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    CHECK(threw);
+    threw = false;
+    try {
+      nn::clip_grad_norm({kept}, -1.f);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    CHECK(threw);
   }
 
   std::printf("grads ok\n");
