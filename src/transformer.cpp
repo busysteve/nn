@@ -80,6 +80,8 @@ const Tensor& Transformer::forward(const IndexTensor& tokens) {
       }
     }
     pos_ids_->copy_from_host(host.data(), pos_ids_->numel());
+    // copy_from_host is async; the local buffer has to stay alive until it finishes.
+    ctx_->synchronize();
   }
   const Tensor& pos = pos_emb_->forward_indices(*pos_ids_);
   ensure_tensor(embedded_, *ctx_, tok.shape());
