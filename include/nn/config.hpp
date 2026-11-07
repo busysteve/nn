@@ -76,7 +76,7 @@ struct TransformerConfig {
   int d_ff = 0;              // post-gate width H; SwiGLU fc1 writes 2H
   int max_seq_len = 0;
   float dropout = 0.f;
-  bool tie_embeddings = false;  // v1: must be false; validate throws if true
+  bool tie_embeddings = false;
   bool bias = false;
   TransformerActivation activation = TransformerActivation::SwiGLU;
   PositionalEncoding positional = PositionalEncoding::LearnedAbsolute;
