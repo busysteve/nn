@@ -17,6 +17,7 @@
 #include "nn/layers/swiglu.hpp"
 #include "nn/layers/transformer_block.hpp"
 #include "nn/loss.hpp"
+#include "nn/transformer.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -98,6 +99,39 @@ std::vector<float> uniform(int64_t n, std::mt19937& rng, float low, float high) 
   std::vector<float> values(static_cast<size_t>(n));
   for (float& value : values) value = dist(rng);
   return values;
+}
+
+size_t argmax_abs(const std::vector<float>& values, size_t begin, size_t end) {
+  CHECK(begin < end);
+  CHECK(end <= values.size());
+  size_t best = begin;
+  float best_abs = std::fabs(values[begin]);
+  for (size_t i = begin + 1; i < end; ++i) {
+    const float magnitude = std::fabs(values[i]);
+    if (magnitude > best_abs) {
+      best_abs = magnitude;
+      best = i;
+    }
+  }
+  CHECK(best_abs > 0.f);
+  return best;
+}
+
+void finite_difference_at(nn::Tensor& value, float analytic, size_t index,
+                          const std::function<double()>& loss, const char* name) {
+  const std::vector<float> original = value.to_host();
+  CHECK(index < original.size());
+  std::vector<float> current = original;
+  current[index] = original[index] + static_cast<float>(kEps);
+  value.copy_from_host(current);
+  const double loss_plus = loss();
+  current[index] = original[index] - static_cast<float>(kEps);
+  value.copy_from_host(current);
+  const double loss_minus = loss();
+  current[index] = original[index];
+  value.copy_from_host(current);
+  const double numeric = (loss_plus - loss_minus) / (2.0 * kEps);
+  check_close(static_cast<double>(analytic), numeric, 1e-2, 1e-4, name, index);
 }
 
 void check_embedding(nn::Embedding& layer, nn::IndexTensor& indices) {
@@ -459,6 +493,47 @@ int test_gradients() {
     for (size_t i = 0; i < host_grad.size(); ++i) {
       check_close(host_grad[i], static_cast<double>(device_grad[i]), 1e-4, -1.0, "grad_logits", i);
     }
+  }
+
+  std::printf("grad transformer facade\n");
+  {
+    nn::TransformerConfig config;
+    config.vocab_size = 10;
+    config.d_model = 8;
+    config.num_heads = 2;
+    config.num_layers = 1;
+    config.d_ff = 16;
+    config.max_seq_len = 4;
+    config.dropout = 0.f;
+    config.bias = false;
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.positional = nn::PositionalEncoding::LearnedAbsolute;
+    nn::Transformer model(ctx, config, 1);
+    nn::IndexTensor tokens(ctx, {1, 3});
+    const std::vector<int64_t> ids = {1, 0, 1};
+    tokens.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
+
+    model.zero_grad();
+    const nn::Tensor& logits = model.forward(tokens);
+    nn::Tensor grad(logits.context(), logits.shape());
+    grad.fill(1.f);
+    model.backward(grad);
+
+    const std::vector<nn::NamedParam> params = model.parameters();
+    CHECK(params[0].name == "tok_emb.weight");
+    CHECK(params[1].name == "pos_emb.weight");
+    const std::vector<float> tok_grad = params[0].grad->to_host();
+    const std::vector<float> pos_grad = params[1].grad->to_host();
+    const size_t tok_index = argmax_abs(tok_grad, 8, 16);
+    const size_t pos_index = argmax_abs(pos_grad, 0, 24);
+    const auto loss = [&]() {
+      const std::vector<float> values = model.forward(tokens).to_host();
+      double sum = 0.0;
+      for (float value : values) sum += static_cast<double>(value);
+      return sum;
+    };
+    finite_difference_at(*params[0].value, tok_grad[tok_index], tok_index, loss, "tok_emb.weight");
+    finite_difference_at(*params[1].value, pos_grad[pos_index], pos_index, loss, "pos_emb.weight");
   }
 
   std::printf("grads ok\n");

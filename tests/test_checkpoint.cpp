@@ -3,7 +3,9 @@
 #include "nn/builders.hpp"
 #include "nn/conv_resnet.hpp"
 #include "nn/error.hpp"
+#include "nn/index_tensor.hpp"
 #include "nn/loss.hpp"
+#include "nn/transformer.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -304,6 +306,92 @@ int test_checkpoint() {
     CHECK(restored.bias == config.bias);
     CHECK(restored.activation == config.activation);
     CHECK(restored.positional == config.positional);
+    expect_throw([&] { nn::Transformer::load(ctx, path, nn::LoadMode::Resume); },
+                 "checkpoint tensor mismatch: count");
+  }
+  {
+    nn::TransformerConfig config;
+    config.vocab_size = 10;
+    config.d_model = 8;
+    config.num_heads = 2;
+    config.num_layers = 1;
+    config.d_ff = 16;
+    config.max_seq_len = 4;
+    config.dropout = 0.f;
+    config.bias = false;
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.positional = nn::PositionalEncoding::LearnedAbsolute;
+    nn::Transformer model(ctx, config, 1);
+    model.train();
+    nn::Sgd optimizer(model.parameters(), 0.1f, 0.9f);
+    model.zero_grad();
+    nn::IndexTensor tokens(ctx, {1, 3});
+    const std::vector<int64_t> ids = {1, 0, 1};
+    tokens.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
+    const nn::Tensor& logits = model.forward(tokens);
+    nn::Tensor grad(ctx, logits.shape());
+    grad.copy_from_host(uniform(logits.numel(), rng));
+    model.backward(grad);
+    optimizer.step();
+    CHECK(optimizer.step_count() == 1);
+
+    const std::filesystem::path path = dir / "transformer-facade.bin";
+    model.save(path, &optimizer);
+    CHECK(read_u32(read_bytes(path), 4) == 2);
+    expect_throw([&] { nn::Network::load(ctx, path, nn::LoadMode::Inference); },
+                 "unsupported checkpoint version 2");
+
+    nn::Context ctx_b;
+    nn::Transformer::Loaded resumed = nn::Transformer::load(ctx_b, path, nn::LoadMode::Resume);
+    CHECK(resumed.optimizer.has_value());
+    CHECK(resumed.step == 1);
+    CHECK(resumed.model.network().family() == nn::Family::Transformer);
+    const std::vector<nn::NamedParam> left = model.parameters();
+    const std::vector<nn::NamedParam> right = resumed.model.parameters();
+    CHECK(left.size() == right.size());
+    for (size_t i = 0; i < left.size(); ++i) {
+      CHECK(left[i].name == right[i].name);
+      expect_bits(left[i].value->to_host(), right[i].value->to_host(), left[i].name.c_str());
+    }
+    CHECK(optimizer.step_count() == resumed.optimizer->step_count());
+    CHECK(optimizer.learning_rate() == resumed.optimizer->learning_rate());
+    CHECK(optimizer.momentum() == resumed.optimizer->momentum());
+    CHECK(optimizer.velocity().size() == resumed.optimizer->velocity().size());
+    for (size_t i = 0; i < optimizer.velocity().size(); ++i) {
+      expect_bits(optimizer.velocity()[i].to_host(), resumed.optimizer->velocity()[i].to_host(),
+                  "velocity");
+    }
+
+    const std::filesystem::path infer_path = dir / "transformer-facade-inf.bin";
+    model.save(infer_path, nullptr);
+    CHECK(read_u32(read_bytes(infer_path), 4) == 1);
+    expect_throw([&] { nn::Transformer::load(ctx, infer_path, nn::LoadMode::Resume); },
+                 "optimizer block missing");
+    expect_throw([&] { nn::Network::load(ctx, infer_path, nn::LoadMode::Inference); },
+                 "checkpoint tensor mismatch: count");
+    nn::Transformer::Loaded loaded =
+        nn::Transformer::load(ctx, infer_path, nn::LoadMode::Inference);
+    CHECK(!loaded.optimizer);
+    CHECK(loaded.step == 0);
+    const nn::TransformerConfig& restored =
+        std::get<nn::TransformerConfig>(loaded.model.network().config());
+    CHECK(restored.vocab_size == config.vocab_size);
+    CHECK(restored.d_model == config.d_model);
+    CHECK(restored.num_heads == config.num_heads);
+    CHECK(restored.num_layers == config.num_layers);
+    CHECK(restored.d_ff == config.d_ff);
+    CHECK(restored.max_seq_len == config.max_seq_len);
+    CHECK(restored.dropout == config.dropout);
+    CHECK(restored.tie_embeddings == config.tie_embeddings);
+    CHECK(restored.bias == config.bias);
+    CHECK(restored.activation == config.activation);
+    CHECK(restored.positional == config.positional);
+    const std::vector<nn::NamedParam> inferred = loaded.model.parameters();
+    CHECK(inferred.size() == left.size());
+    for (size_t i = 0; i < left.size(); ++i) {
+      CHECK(left[i].name == inferred[i].name);
+      expect_bits(left[i].value->to_host(), inferred[i].value->to_host(), left[i].name.c_str());
+    }
   }
   {
     nn::ConvConfig config;

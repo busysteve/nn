@@ -763,6 +763,56 @@ nn::Tensor hidden(ctx, {1, 3, 8});
 const nn::Tensor& logits = net.forward(hidden);  // (1, 3, 10)
 ```
 
+### Transformer
+
+Header: `nn/transformer.hpp`
+
+`Transformer` owns `tok_emb` and the learned-absolute `pos_emb` outside the trunk. The trunk is a family-6 `Network`: `blocks.i`, `final_ln`, and `lm_head`. Those embeddings are not layers of the network.
+
+```cpp
+class Transformer {
+ public:
+  Transformer(Context& ctx, const TransformerConfig& config, uint32_t seed);
+
+  const Tensor& forward(const IndexTensor& tokens);  // (N, T) -> logits (N, T, V)
+  const Tensor& forward(const Tensor& embeddings);   // (N, T, D) -> logits, skips both embeddings
+  const Tensor& backward(const Tensor& grad_logits);
+
+  void zero_grad();
+  void train();
+  void eval();
+  bool training() const;
+
+  std::vector<NamedParam> parameters() const;
+  const Network& network() const;
+
+  void save(const std::filesystem::path& path, const Sgd* optimizer) const;
+  static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
+};
+
+struct Transformer::Loaded {
+  Transformer model;
+  std::optional<Sgd> optimizer;
+  uint64_t step = 0;
+};
+```
+
+`forward(const IndexTensor&)` reads token ids of shape `(N, T)` and returns logits `(N, T, vocab_size)`. Rank other than 2 throws `tokens`. `T > max_seq_len` throws `max_seq_len` before either embedding runs. Learned-absolute positions are the column index `0 .. T-1` on every row, added to the token embedding. `forward(const Tensor&)` reads a float tensor `(N, T, d_model)` and skips both embeddings. A rank or width mismatch throws `embeddings`. Backward after that hook does not update embedding gradients.
+
+`parameters()` is `tok_emb.weight`, then `pos_emb.weight`, then `network().parameters()`. `network().parameters()` does not include `tok_emb` or `pos_emb`.
+
+`save(path, nullptr)` writes version 1 with no optimizer block. `save(path, sgd)` writes version 2 and optimizer kind `1` (SGD) before the SGD body. Both files include `tok_emb.weight` and `pos_emb.weight`, then the trunk parameters. `LoadMode::Resume` restores that SGD into `Loaded::optimizer`. `LoadMode::Inference` leaves `optimizer` empty. A version-2 kind other than 1 throws. `Network::load` still accepts only version 1.
+
+```cpp
+nn::Transformer model(ctx, config, /*seed=*/1);
+nn::IndexTensor tokens(ctx, {1, 3});
+const nn::Tensor& logits = model.forward(tokens);  // (1, 3, vocab_size)
+nn::Tensor hidden(ctx, {1, 3, config.d_model});
+const nn::Tensor& hooked = model.forward(hidden);
+model.save(path, nullptr);
+nn::Transformer::Loaded loaded = nn::Transformer::load(ctx, path, nn::LoadMode::Inference);
+```
+
 ## Network
 
 Header: `nn/network.hpp`
@@ -964,7 +1014,7 @@ nn::Network::Loaded resumed = nn::Network::load(ctx, path, nn::LoadMode::Resume)
 |---|---|
 | Unreadable, shorter than 32 bytes, or cut off mid-record | `truncated checkpoint` |
 | Wrong magic | `bad checkpoint magic` |
-| Version other than 1 | `unsupported checkpoint version N` |
+| Version other than 1 (`Network::load`) | `unsupported checkpoint version N` |
 | Bad train flag, optimizer flag, or reserved word | `bad checkpoint header` |
 | Family outside 1..6 | `bad checkpoint family` |
 | `ConvResNet::load` of another family | `bad checkpoint family` |
@@ -973,7 +1023,7 @@ nn::Network::Loaded resumed = nn::Network::load(ctx, path, nn::LoadMode::Resume)
 | Optimizer record count disagrees | `optimizer state mismatch` |
 | `save` optimizer belongs to other parameters | `optimizer does not belong to this network` |
 
-The byte layout is version 1, little-endian, in [README.md](README.md). The file holds the config, the parameters, the batch-norm running statistics, and, when requested, the velocity. It leaves out activation caches, gradients, workspaces, and cuDNN descriptors.
+The byte layout of a `Network` file is version 1, little-endian, in [README.md](README.md). The file holds the config, the parameters, the batch-norm running statistics, and, when requested, the velocity. It leaves out activation caches, gradients, workspaces, and cuDNN descriptors. A `Transformer` file is version 1 with no optimizer, or version 2 with SGD kind 1. `Network::load` still rejects version 2.
 
 ## kaiming_normal
 

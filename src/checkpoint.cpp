@@ -1,5 +1,6 @@
 #include "nn/builders.hpp"
 #include "nn/error.hpp"
+#include "nn/transformer.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -145,6 +146,7 @@ struct ParsedOpt {
 };
 
 struct Header {
+  uint32_t version = 0;
   uint32_t family = 0;
   uint32_t training = 0;
   uint64_t step = 0;
@@ -192,14 +194,15 @@ std::vector<uint8_t> read_file(const std::filesystem::path& path) {
   return bytes;
 }
 
-Header read_header(ByteReader& reader) {
+Header read_header(ByteReader& reader, uint32_t max_version = kVersion) {
   const uint32_t magic = reader.u32();
   if (magic != kMagic) throw Error("bad checkpoint magic");
   const uint32_t version = reader.u32();
-  if (version != kVersion) {
+  if (version < 1u || version > max_version) {
     throw Error("unsupported checkpoint version " + std::to_string(version));
   }
   Header header;
+  header.version = version;
   header.family = reader.u32();
   header.training = reader.u32();
   header.step = reader.u64();
@@ -398,6 +401,89 @@ void require_match(const ParsedParam& parsed, const NamedParam& param) {
   }
 }
 
+constexpr uint32_t kSgdKind = 1u;
+
+void write_transformer_config(ByteWriter& writer, const TransformerConfig& config) {
+  writer.i32(config.vocab_size);
+  writer.i32(config.d_model);
+  writer.i32(config.num_heads);
+  writer.i32(config.num_layers);
+  writer.i32(config.d_ff);
+  writer.i32(config.max_seq_len);
+  writer.f32(config.dropout);
+  writer.u32(config.tie_embeddings ? 1u : 0u);
+  writer.u32(config.bias ? 1u : 0u);
+  writer.u32(static_cast<uint32_t>(config.activation));
+  writer.u32(static_cast<uint32_t>(config.positional));
+}
+
+void write_params(ByteWriter& writer, const std::vector<NamedParam>& params) {
+  writer.u32(static_cast<uint32_t>(params.size()));
+  writer.u32(0);
+  for (const NamedParam& param : params) {
+    const std::vector<float> values = param.value->to_host();
+    writer.str(param.name);
+    writer.shape(param.value->shape());
+    writer.u32(kFloat32);
+    writer.u32(static_cast<uint32_t>(values.size()));
+    writer.f32s(values);
+    writer.pad8();
+  }
+}
+
+void write_bn(ByteWriter& writer, const std::vector<NamedBuffer>& buffers) {
+  if (buffers.size() % 2 != 0) throw Error("checkpoint tensor mismatch: batch-norm buffers");
+  writer.u32(static_cast<uint32_t>(buffers.size() / 2));
+  writer.u32(0);
+  for (size_t i = 0; i < buffers.size(); i += 2) {
+    const std::string mean_prefix = strip_suffix(buffers[i].name, ".running_mean");
+    const std::string var_prefix = strip_suffix(buffers[i + 1].name, ".running_var");
+    if (mean_prefix.empty() || mean_prefix != var_prefix) {
+      throw Error("checkpoint tensor mismatch: " + buffers[i].name);
+    }
+    const std::vector<float> mean = buffers[i].value->to_host();
+    const std::vector<float> var = buffers[i + 1].value->to_host();
+    writer.str(mean_prefix);
+    writer.u64(*buffers[i].batches);
+    writer.u32(static_cast<uint32_t>(mean.size()));
+    writer.u32(0);
+    writer.f32s(mean);
+    writer.f32s(var);
+    writer.pad8();
+  }
+}
+
+void write_sgd(ByteWriter& writer, const Sgd& optimizer) {
+  writer.f32(optimizer.learning_rate());
+  writer.f32(optimizer.momentum());
+  writer.u32(static_cast<uint32_t>(optimizer.velocity().size()));
+  writer.u32(0);
+  for (const Tensor& velocity : optimizer.velocity()) {
+    const std::vector<float> values = velocity.to_host();
+    writer.u32(static_cast<uint32_t>(values.size()));
+    writer.u32(0);
+    writer.f32s(values);
+    writer.pad8();
+  }
+}
+
+void commit_checkpoint(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
+  const std::filesystem::path tmp = path.string() + ".tmp";
+  int fd = ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+  if (fd < 0) throw Error(std::string("checkpoint write: ") + std::strerror(errno));
+  try {
+    write_all(fd, bytes.data(), bytes.size());
+    if (::fsync(fd) != 0) throw Error(std::string("checkpoint write: ") + std::strerror(errno));
+    if (::close(fd) != 0) throw Error(std::string("checkpoint write: ") + std::strerror(errno));
+    fd = -1;
+    std::filesystem::rename(tmp, path);
+  } catch (...) {
+    if (fd >= 0) ::close(fd);
+    ::unlink(tmp.c_str());
+    throw;
+  }
+}
+
 }  // namespace
 
 void Network::save(const std::filesystem::path& path, const Sgd* optimizer) const {
@@ -486,81 +572,16 @@ void Network::save(const std::filesystem::path& path, const Sgd* optimizer) cons
           for (int width : config.hidden) writer.i32(width);
         } else {
           static_assert(std::is_same_v<T, TransformerConfig>);
-          writer.i32(config.vocab_size);
-          writer.i32(config.d_model);
-          writer.i32(config.num_heads);
-          writer.i32(config.num_layers);
-          writer.i32(config.d_ff);
-          writer.i32(config.max_seq_len);
-          writer.f32(config.dropout);
-          writer.u32(config.tie_embeddings ? 1u : 0u);
-          writer.u32(config.bias ? 1u : 0u);
-          writer.u32(static_cast<uint32_t>(config.activation));
-          writer.u32(static_cast<uint32_t>(config.positional));
+          write_transformer_config(writer, config);
         }
       },
       config_);
   writer.pad8();
 
-  writer.u32(static_cast<uint32_t>(params.size()));
-  writer.u32(0);
-  for (const NamedParam& param : params) {
-    const std::vector<float> values = param.value->to_host();
-    writer.str(param.name);
-    writer.shape(param.value->shape());
-    writer.u32(kFloat32);
-    writer.u32(static_cast<uint32_t>(values.size()));
-    writer.f32s(values);
-    writer.pad8();
-  }
-
-  writer.u32(static_cast<uint32_t>(buffers.size() / 2));
-  writer.u32(0);
-  for (size_t i = 0; i < buffers.size(); i += 2) {
-    const std::string mean_prefix = strip_suffix(buffers[i].name, ".running_mean");
-    const std::string var_prefix = strip_suffix(buffers[i + 1].name, ".running_var");
-    if (mean_prefix.empty() || mean_prefix != var_prefix) {
-      throw Error("checkpoint tensor mismatch: " + buffers[i].name);
-    }
-    const std::vector<float> mean = buffers[i].value->to_host();
-    const std::vector<float> var = buffers[i + 1].value->to_host();
-    writer.str(mean_prefix);
-    writer.u64(*buffers[i].batches);
-    writer.u32(static_cast<uint32_t>(mean.size()));
-    writer.u32(0);
-    writer.f32s(mean);
-    writer.f32s(var);
-    writer.pad8();
-  }
-
-  if (optimizer) {
-    writer.f32(optimizer->learning_rate());
-    writer.f32(optimizer->momentum());
-    writer.u32(static_cast<uint32_t>(optimizer->velocity().size()));
-    writer.u32(0);
-    for (const Tensor& velocity : optimizer->velocity()) {
-      const std::vector<float> values = velocity.to_host();
-      writer.u32(static_cast<uint32_t>(values.size()));
-      writer.u32(0);
-      writer.f32s(values);
-      writer.pad8();
-    }
-  }
-
-  const std::filesystem::path tmp = path.string() + ".tmp";
-  int fd = ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-  if (fd < 0) throw Error(std::string("checkpoint write: ") + std::strerror(errno));
-  try {
-    write_all(fd, writer.bytes().data(), writer.bytes().size());
-    if (::fsync(fd) != 0) throw Error(std::string("checkpoint write: ") + std::strerror(errno));
-    if (::close(fd) != 0) throw Error(std::string("checkpoint write: ") + std::strerror(errno));
-    fd = -1;
-    std::filesystem::rename(tmp, path);
-  } catch (...) {
-    if (fd >= 0) ::close(fd);
-    ::unlink(tmp.c_str());
-    throw;
-  }
+  write_params(writer, params);
+  write_bn(writer, buffers);
+  if (optimizer) write_sgd(writer, *optimizer);
+  commit_checkpoint(path, writer.bytes());
 }
 
 Network::Loaded Network::load(Context& ctx, const std::filesystem::path& path, LoadMode mode) {
@@ -617,6 +638,79 @@ Network::Loaded Network::load(Context& ctx, const std::filesystem::path& path, L
   Loaded loaded{std::move(network), std::nullopt, header.step};
   if (mode == LoadMode::Resume) {
     Sgd optimizer(loaded.network.parameters(), parsed_opt->learning_rate, parsed_opt->momentum);
+    for (size_t i = 0; i < parsed_opt->velocity.size(); ++i) {
+      optimizer.velocity()[i].copy_from_host(parsed_opt->velocity[i]);
+    }
+    optimizer.set_step_count(header.step);
+    loaded.optimizer = std::move(optimizer);
+  }
+  ctx.synchronize();
+  return loaded;
+}
+
+void Transformer::save(const std::filesystem::path& path, const Sgd* optimizer) const {
+  if (optimizer) {
+    const std::vector<NamedParam> mine = parameters();
+    const std::vector<NamedParam>& theirs = optimizer->params();
+    if (mine.size() != theirs.size()) throw Error("optimizer does not belong to this network");
+    for (size_t i = 0; i < mine.size(); ++i) {
+      if (mine[i].value != theirs[i].value) throw Error("optimizer does not belong to this network");
+    }
+  }
+  ctx_->synchronize();
+  const std::vector<NamedParam> params = parameters();
+  const TransformerConfig& config = std::get<TransformerConfig>(network().config());
+
+  ByteWriter writer;
+  writer.u32(kMagic);
+  writer.u32(optimizer ? 2u : kVersion);
+  writer.u32(static_cast<uint32_t>(network().family()));
+  writer.u32(training() ? 1u : 0u);
+  writer.u64(optimizer ? optimizer->step_count() : 0);
+  writer.u32(optimizer ? 1u : 0u);
+  writer.u32(0);
+  write_transformer_config(writer, config);
+  writer.pad8();
+  write_params(writer, params);
+  write_bn(writer, {});
+  if (optimizer) {
+    writer.u32(kSgdKind);
+    write_sgd(writer, *optimizer);
+  }
+  commit_checkpoint(path, writer.bytes());
+}
+
+Transformer::Loaded Transformer::load(Context& ctx, const std::filesystem::path& path, LoadMode mode) {
+  ByteReader reader(read_file(path));
+  const Header header = read_header(reader, 2u);
+  if (header.family != static_cast<uint32_t>(Family::Transformer)) throw Error("bad checkpoint family");
+  const auto config_var = read_config(reader, header.family);
+  const TransformerConfig& config = std::get<TransformerConfig>(config_var);
+  uint32_t param_count = 0;
+  const std::vector<ParsedParam> parsed_params = read_params(reader, &param_count);
+  const std::vector<ParsedBn> parsed_bn = read_bn(reader);
+  if (!parsed_bn.empty()) throw Error("checkpoint tensor mismatch: batch-norm buffers");
+  std::optional<ParsedOpt> parsed_opt;
+  if (header.optimizer_present) {
+    if (header.version == 2u) {
+      const uint32_t kind = reader.u32();
+      if (kind != kSgdKind) throw Error("unsupported optimizer kind");
+    }
+    parsed_opt = read_opt(reader, parsed_params);
+  }
+  if (mode == LoadMode::Resume && !parsed_opt) throw Error("optimizer block missing");
+
+  Transformer model(ctx, config, 0);
+  const std::vector<NamedParam> params = model.parameters();
+  if (params.size() != parsed_params.size()) throw Error("checkpoint tensor mismatch: count");
+  for (size_t i = 0; i < params.size(); ++i) require_match(parsed_params[i], params[i]);
+  for (size_t i = 0; i < params.size(); ++i) params[i].value->copy_from_host(parsed_params[i].data);
+  if (header.training) model.train();
+  else model.eval();
+
+  Loaded loaded{std::move(model), std::nullopt, header.step};
+  if (mode == LoadMode::Resume) {
+    Sgd optimizer(loaded.model.parameters(), parsed_opt->learning_rate, parsed_opt->momentum);
     for (size_t i = 0; i < parsed_opt->velocity.size(); ++i) {
       optimizer.velocity()[i].copy_from_host(parsed_opt->velocity[i]);
     }

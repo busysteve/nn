@@ -1,0 +1,61 @@
+#pragma once
+
+#include "nn/layers/embedding.hpp"
+#include "nn/network.hpp"
+
+#include <memory>
+#include <optional>
+#include <vector>
+
+namespace nn {
+
+class TransformerBlock;
+class LayerNorm;
+class Linear;
+
+class Transformer {
+ public:
+  Transformer(Context& ctx, const TransformerConfig& config, uint32_t seed);
+  Transformer(Transformer&&) noexcept = default;
+  Transformer& operator=(Transformer&&) noexcept = default;
+  Transformer(const Transformer&) = delete;
+  Transformer& operator=(const Transformer&) = delete;
+
+  const Tensor& forward(const IndexTensor& tokens);
+  const Tensor& forward(const Tensor& embeddings);
+  const Tensor& backward(const Tensor& grad_logits);
+
+  void zero_grad();
+  void train();
+  void eval();
+  bool training() const;
+
+  std::vector<NamedParam> parameters() const;
+  const Network& network() const;
+
+  void save(const std::filesystem::path& path, const Sgd* optimizer) const;
+
+  struct Loaded;
+  static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
+
+ private:
+  Context* ctx_ = nullptr;
+  std::unique_ptr<Embedding> tok_emb_;
+  std::unique_ptr<Embedding> pos_emb_;
+  std::vector<TransformerBlock*> block_ptrs_;
+  LayerNorm* final_ln_ptr_ = nullptr;
+  Linear* lm_head_ptr_ = nullptr;
+  std::optional<Network> network_;
+  std::optional<Tensor> embedded_;
+  std::optional<IndexTensor> pos_ids_;
+  bool forwarded_ = false;
+  bool used_embeddings_ = false;
+};
+
+struct Transformer::Loaded {
+  Transformer model;
+  std::optional<Sgd> optimizer;
+  uint64_t step = 0;
+};
+
+}  // namespace nn

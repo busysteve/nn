@@ -363,6 +363,24 @@ Input shape is `(N, T, input_size)`. Output shape is `(N, output_size)`. `T` is 
 
 `Family::Transformer` is `6`. `validate` checks the fields above. `build_transformer_network` emits one `TransformerBlock` per layer, named `blocks.i`, then `LayerNorm` named `final_ln` (default eps `1e-5`), then `Linear` named `lm_head` from `d_model` to `vocab_size`. The trunk is those blocks, the final LayerNorm, and `lm_head`. It does not own token embeddings or a position table. Each block is built with `use_rope` false. Forward input is a float tensor `(N, T, d_model)`. Output is `(N, T, vocab_size)`. `T` is not checked against `max_seq_len`.
 
+### Transformer
+
+Header: `nn/transformer.hpp`.
+
+`Transformer` is a façade. It owns the token embedding and the learned-absolute position embedding outside `Network`. The network is the family-6 trunk: `blocks.i`, `final_ln`, and `lm_head`.
+
+```cpp
+Transformer model(ctx, config, /*seed=*/1);
+const nn::Tensor& logits = model.forward(tokens);  // IndexTensor (N, T) -> (N, T, vocab_size)
+const nn::Tensor& hooked = model.forward(hidden);  // float (N, T, d_model) -> (N, T, vocab_size)
+```
+
+`tokens` has rank 2. `T > max_seq_len` throws `max_seq_len` before either embedding runs. Learned-absolute positions are the column index `0 .. T-1` on every row. The float `forward` skips both embeddings. Backward on that path does not change their gradients.
+
+`parameters()` is `tok_emb.weight`, then `pos_emb.weight`, then `network().parameters()` (`blocks.0.ln1.weight`, ..., `final_ln.weight`, `lm_head.weight`). `network().parameters()` does not include `tok_emb`.
+
+`save(path, nullptr)` writes version 1, family 6, no optimizer block, and those parameters, including `tok_emb.weight` and `pos_emb.weight`. `save(path, sgd)` writes version 2 with `optimizer_present` 1 and optimizer kind `1` (SGD) followed by the SGD body. `load` in `LoadMode::Resume` restores that SGD into `Loaded::optimizer`. `LoadMode::Inference` leaves `optimizer` empty. A version-2 kind other than 1 throws. `Network::load` still accepts only version 1 and does not read these embeddings.
+
 ### MNIST shapes
 
 MLP `784 → 256 → 128 → 10` takes `(N, 784)` and returns `(N, 10)`.
@@ -640,21 +658,21 @@ The file is little-endian. Sections are padded to 8 bytes. Strings are a `uint32
 
 The file does not contain activation caches, gradients, workspaces, or cuDNN descriptors. Descriptors are rebuilt from shapes on the next forward.
 
-Magic is `0x314E4E43` (`CNN1` on disk). Version is `1`. Any other version throws `unsupported checkpoint version N`.
+Magic is `0x314E4E43` (`CNN1` on disk). `Network::save` writes version `1`. `Network::load` throws `unsupported checkpoint version N` for any other version. `Transformer::save` writes version `1` with no optimizer and version `2` with SGD kind `1`.
 
 ### Header (32 bytes)
 
 | Offset | Type | Meaning |
 |---:|---|---|
 | 0 | `uint32` | Magic `0x314E4E43`. |
-| 4 | `uint32` | Version `1`. |
+| 4 | `uint32` | Version. `1` for `Network::save` and for a `Transformer` saved without an optimizer. `2` for a `Transformer` saved with SGD. |
 | 8 | `uint32` | Family: `1` MLP, `2` conv, `3` ResNet, `4` ConvResNet, `5` RNN, `6` transformer. |
 | 12 | `uint32` | Train flag: `1` train, `0` eval. |
 | 16 | `uint64` | Optimizer step, or 0 when no optimizer is saved. |
 | 24 | `uint32` | `1` when an optimizer block follows, else `0`. |
 | 28 | `uint32` | Reserved. Must be 0. |
 
-A train flag or optimizer flag outside `{0, 1}`, or a non-zero reserved word, throws `bad checkpoint header`. A family outside 1..6 throws `bad checkpoint family`. Version stays `1`.
+A train flag or optimizer flag outside `{0, 1}`, or a non-zero reserved word, throws `bad checkpoint header`. A family outside 1..6 throws `bad checkpoint family`. `Network::load` requires version `1`.
 
 ### Config
 
@@ -717,6 +735,8 @@ Present only when the header flag is 1.
 | velocity records | for each parameter, in the same order: `uint32` numel, `uint32` reserved 0, that many float32 values, pad to 8 |
 
 A count or numel mismatch throws `optimizer state mismatch`.
+
+`Transformer::save` with an `Sgd*` writes version `2` and, immediately before this body, a `uint32` kind. Kind `1` is SGD. `Transformer::save` with a null optimizer writes version `1` and omits the kind and the body. `Transformer::load` of version 1 reads this body when the optimizer flag is set, with no kind tag. A kind other than `1` throws. Parameter records in a façade file are `tok_emb.weight`, `pos_emb.weight`, then the trunk names.
 
 ### Load failures
 
@@ -796,11 +816,11 @@ CTest timeouts are 900 seconds for `shapes`, `grads`, and `ckpt`, and 7200 secon
 
 Images are scaled by `1/255` into `[0, 1]`. Labels are `int64` class indices. The loader is part of the test binary, not the library.
 
-`shapes` checks forward and backward ranks for several depths and widths of each family, including a ResNet stage that downsamples, a stage that uses a projection, a ConvResNet with a conv trunk, a stem, and residual stages, MLP networks that use GELU and SwiGLU, an RNN, and a transformer trunk.
+`shapes` checks forward and backward ranks for several depths and widths of each family, including a ResNet stage that downsamples, a stage that uses a projection, a ConvResNet with a conv trunk, a stem, and residual stages, MLP networks that use GELU and SwiGLU, an RNN, a transformer trunk, and a Transformer façade over that trunk.
 
 `grads` compares analytic backward with central finite differences at epsilon `1e-3`, including GELU, SwiGLU, and an RNN. Parameter gradients pass when the relative error is at most `1e-2` or the absolute error is at most `1e-4`. Softmax cross-entropy uses relative `1e-5` on the scalar loss and relative `1e-4` on `grad_logits`.
 
-`ckpt` saves one small network of each family, plus GELU and SwiGLU MLPs, loads each into a new context, and compares parameter bytes and batch-norm statistics bitwise. A second eval forward matches the original logits bitwise. A truncated file and a tampered size field throw. Reloading with `LoadMode::Resume` restores momentum and the step, and one more optimizer step matches a network that was never saved.
+`ckpt` saves one small network of each family, plus GELU and SwiGLU MLPs, loads each into a new context, and compares parameter bytes and batch-norm statistics bitwise. A second eval forward matches the original logits bitwise. A truncated file and a tampered size field throw. Reloading with `LoadMode::Resume` restores momentum and the step, and one more optimizer step matches a network that was never saved. It also round-trips a Transformer façade, including both embeddings and SGD velocity.
 
 `mnist` trains three models with seed 1, batch 128 (the last training batch has 96 examples), eval batch 256 (the last eval batch has 16), and momentum 0.9. The data order of each epoch is shuffled with `std::mt19937(1 + epoch)`.
 
@@ -816,6 +836,6 @@ At the start of the ResNet's last epoch the test zeros every `running_mean`, fil
 
 ## Scope
 
-The library is a fixed set of layers with manual backward passes, six builders, one loss, one optimizer, and one checkpoint version. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
+The library is a fixed set of layers with manual backward passes, six builders, one loss, and one optimizer. `Network` checkpoints are version 1. A `Transformer` checkpoint is version 1 without an optimizer and version 2 with SGD kind 1. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
 
 It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, ConvResNet models that can include a conv trunk, residual stages, or both, Elman RNNs, and a decoder-only transformer trunk of blocks, a final LayerNorm, and `lm_head`. That trunk reads a float tensor `(N, T, d_model)`. Conv, ResNet, and ConvResNet builders use ReLU. The training set exercised by the suite is MNIST.

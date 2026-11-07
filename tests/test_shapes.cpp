@@ -18,6 +18,7 @@
 #include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
 #include "nn/layers/transformer_block.hpp"
+#include "nn/transformer.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1221,6 +1222,64 @@ int test_shapes() {
     }
     check_io(ctx, net, {1, 3, 8}, {1, 3, 10});
     check_io(ctx, net, {1, 5, 8}, {1, 5, 10});
+  }
+
+  {
+    nn::TransformerConfig config;
+    config.vocab_size = 10;
+    config.d_model = 8;
+    config.num_heads = 2;
+    config.num_layers = 1;
+    config.d_ff = 16;
+    config.max_seq_len = 4;
+    config.dropout = 0.f;
+    config.bias = false;
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.positional = nn::PositionalEncoding::LearnedAbsolute;
+    config.tie_embeddings = true;
+    expect_invalid([&] { nn::Transformer(ctx, config, 1); }, "tie_embeddings");
+    config.tie_embeddings = false;
+
+    nn::Transformer model(ctx, config, 1);
+    const std::vector<nn::NamedParam> params = model.parameters();
+    CHECK(params.size() >= 3);
+    CHECK(params[0].name == "tok_emb.weight");
+    CHECK(params[0].value->shape() == std::vector<int>({10, 8}));
+    CHECK(params[1].name == "pos_emb.weight");
+    CHECK(params[1].value->shape() == std::vector<int>({4, 8}));
+    CHECK(params[2].name == "blocks.0.ln1.weight");
+    bool saw_final = false;
+    bool saw_head = false;
+    for (const nn::NamedParam& param : params) {
+      if (param.name == "final_ln.weight") saw_final = true;
+      if (param.name == "lm_head.weight") saw_head = true;
+    }
+    CHECK(saw_final);
+    CHECK(saw_head);
+    for (const nn::NamedParam& param : model.network().parameters()) {
+      CHECK(param.name.find("tok_emb") == std::string::npos);
+    }
+
+    nn::IndexTensor tokens(ctx, {1, 3});
+    const std::vector<int64_t> ids = {1, 0, 2};
+    tokens.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
+    CHECK(model.forward(tokens).shape() == std::vector<int>({1, 3, 10}));
+
+    nn::IndexTensor long_tokens(ctx, {1, 5});
+    const std::vector<int64_t> long_ids(5, 0);
+    long_tokens.copy_from_host(long_ids.data(), static_cast<int64_t>(long_ids.size()));
+    expect_invalid([&] { model.forward(long_tokens); }, "max_seq_len");
+
+    model.zero_grad();
+    nn::Tensor hidden(ctx, {1, 3, 8});
+    hidden.fill(0.1f);
+    const nn::Tensor& logits = model.forward(hidden);
+    CHECK(logits.shape() == std::vector<int>({1, 3, 10}));
+    nn::Tensor grad(ctx, logits.shape());
+    grad.fill(1.f);
+    model.backward(grad);
+    const std::vector<float> emb_grad = model.parameters()[0].grad->to_host();
+    for (float value : emb_grad) CHECK(value == 0.f);
   }
 
   CHECK(nn::conv_out_size(28, 5, 1, 2) == 28);
