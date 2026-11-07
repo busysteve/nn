@@ -689,6 +689,30 @@ void write_model(ByteWriter& writer, const Network& network, uint32_t version, u
   write_bn(writer, buffers);
 }
 
+AdamW resume_adamw(const std::vector<NamedParam>& live, const ParsedAdamW& parsed, uint64_t step) {
+  std::vector<AdamWGroup> groups;
+  groups.reserve(parsed.groups.size());
+  size_t cursor = 0;
+  for (const ParsedAdamGroup& group : parsed.groups) {
+    AdamWGroup built;
+    built.weight_decay = group.weight_decay;
+    built.params.reserve(group.m.size());
+    for (size_t i = 0; i < group.m.size(); ++i) built.params.push_back(live[cursor + i]);
+    cursor += group.m.size();
+    groups.push_back(std::move(built));
+  }
+  AdamW adamw(std::move(groups), parsed.lr, parsed.beta1, parsed.beta2, parsed.eps);
+  size_t flat = 0;
+  for (const ParsedAdamGroup& group : parsed.groups) {
+    for (size_t i = 0; i < group.m.size(); ++i, ++flat) {
+      adamw.m()[flat].copy_from_host(group.m[i]);
+      adamw.v()[flat].copy_from_host(group.v[i]);
+    }
+  }
+  adamw.set_step_count(step);
+  return adamw;
+}
+
 }  // namespace
 
 void Network::save(const std::filesystem::path& path, const Sgd* optimizer) const {
@@ -781,29 +805,7 @@ Network::Loaded Network::load(Context& ctx, const std::filesystem::path& path, L
     optimizer.set_step_count(header.step);
     loaded.optimizer = std::move(optimizer);
   } else if (mode == LoadMode::Resume && parsed_adamw) {
-    const std::vector<NamedParam> live = loaded.network.parameters();
-    std::vector<AdamWGroup> groups;
-    groups.reserve(parsed_adamw->groups.size());
-    size_t cursor = 0;
-    for (const ParsedAdamGroup& group : parsed_adamw->groups) {
-      AdamWGroup built;
-      built.weight_decay = group.weight_decay;
-      built.params.reserve(group.m.size());
-      for (size_t i = 0; i < group.m.size(); ++i) built.params.push_back(live[cursor + i]);
-      cursor += group.m.size();
-      groups.push_back(std::move(built));
-    }
-    AdamW adamw(std::move(groups), parsed_adamw->lr, parsed_adamw->beta1, parsed_adamw->beta2,
-                parsed_adamw->eps);
-    size_t flat = 0;
-    for (const ParsedAdamGroup& group : parsed_adamw->groups) {
-      for (size_t i = 0; i < group.m.size(); ++i, ++flat) {
-        adamw.m()[flat].copy_from_host(group.m[i]);
-        adamw.v()[flat].copy_from_host(group.v[i]);
-      }
-    }
-    adamw.set_step_count(header.step);
-    loaded.adamw = std::move(adamw);
+    loaded.adamw = resume_adamw(loaded.network.parameters(), *parsed_adamw, header.step);
   }
   ctx.synchronize();
   return loaded;
@@ -912,29 +914,7 @@ Transformer::Loaded Transformer::load(Context& ctx, const std::filesystem::path&
     optimizer.set_step_count(header.step);
     loaded.optimizer = std::move(optimizer);
   } else if (mode == LoadMode::Resume && parsed_adamw) {
-    const std::vector<NamedParam> live = loaded.model.parameters();
-    std::vector<AdamWGroup> groups;
-    groups.reserve(parsed_adamw->groups.size());
-    size_t cursor = 0;
-    for (const ParsedAdamGroup& group : parsed_adamw->groups) {
-      AdamWGroup built;
-      built.weight_decay = group.weight_decay;
-      built.params.reserve(group.m.size());
-      for (size_t i = 0; i < group.m.size(); ++i) built.params.push_back(live[cursor + i]);
-      cursor += group.m.size();
-      groups.push_back(std::move(built));
-    }
-    AdamW adamw(std::move(groups), parsed_adamw->lr, parsed_adamw->beta1, parsed_adamw->beta2,
-                parsed_adamw->eps);
-    size_t flat = 0;
-    for (const ParsedAdamGroup& group : parsed_adamw->groups) {
-      for (size_t i = 0; i < group.m.size(); ++i, ++flat) {
-        adamw.m()[flat].copy_from_host(group.m[i]);
-        adamw.v()[flat].copy_from_host(group.v[i]);
-      }
-    }
-    adamw.set_step_count(header.step);
-    loaded.adamw = std::move(adamw);
+    loaded.adamw = resume_adamw(loaded.model.parameters(), *parsed_adamw, header.step);
   }
   ctx.synchronize();
   return loaded;

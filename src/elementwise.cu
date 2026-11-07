@@ -40,11 +40,6 @@ __global__ void mul_kernel(float* y, const float* a, const float* b, int64_t n) 
   if (i < n) y[i] = a[i] * b[i];
 }
 
-__global__ void scale_inplace_kernel(float* x, int64_t n, float factor) {
-  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i < n) x[i] *= factor;
-}
-
 __device__ float gelu_forward(float x) {
   constexpr float kInvSqrt2 = 0.7071067811865476f;
   return 0.5f * x * (1.f + erff(x * kInvSqrt2));
@@ -175,9 +170,7 @@ void launch_mul(cudaStream_t stream, float* y, const float* a, const float* b, i
 }
 
 void Tensor::scale(float factor) {
-  if (numel_ <= 0) return;
-  scale_inplace_kernel<<<blocks_for(numel_), 256, 0, stream_of(*ctx_)>>>(data_, numel_, factor);
-  check_cuda(cudaGetLastError(), "scale");
+  launch_scale(stream_of(*ctx_), data_, numel_, factor);
 }
 
 void launch_gelu(cudaStream_t stream, float* y, const float* x, int64_t n) {
