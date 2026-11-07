@@ -6,12 +6,14 @@
 #include "nn/layers/gelu.hpp"
 #include "nn/layers/global_avg_pool2d.hpp"
 #include "nn/layers/last_step.hpp"
+#include "nn/layers/layer_norm.hpp"
 #include "nn/layers/linear.hpp"
 #include "nn/layers/max_pool2d.hpp"
 #include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
 #include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
+#include "nn/layers/transformer_block.hpp"
 
 #include <random>
 
@@ -200,6 +202,32 @@ Network build_rnn(Context& ctx, const RnnConfig& config, uint32_t seed) {
   head->set_name("head");
   layers.push_back(std::move(head));
   return Network(ctx, Family::Rnn, std::move(layers), config);
+}
+
+Network build_transformer_network(Context& ctx, const TransformerConfig& config, uint32_t seed) {
+  validate(config);
+  std::mt19937 rng(seed);
+  std::vector<std::unique_ptr<Layer>> layers;
+  for (int i = 0; i < config.num_layers; ++i) {
+    TransformerBlockSpec spec;
+    spec.d_model = config.d_model;
+    spec.num_heads = config.num_heads;
+    spec.d_ff = config.d_ff;
+    spec.dropout = config.dropout;
+    spec.bias = config.bias;
+    spec.use_rope = false;
+    spec.activation = config.activation;
+    auto block = std::make_unique<TransformerBlock>(ctx, spec, rng);
+    block->set_name(index_name("blocks", static_cast<size_t>(i)));
+    layers.push_back(std::move(block));
+  }
+  auto final_ln = std::make_unique<LayerNorm>(ctx, config.d_model);
+  final_ln->set_name("final_ln");
+  layers.push_back(std::move(final_ln));
+  auto lm_head = std::make_unique<Linear>(ctx, config.d_model, config.vocab_size, config.bias, rng);
+  lm_head->set_name("lm_head");
+  layers.push_back(std::move(lm_head));
+  return Network(ctx, Family::Transformer, std::move(layers), config);
 }
 
 }  // namespace nn

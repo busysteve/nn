@@ -119,4 +119,23 @@ void validate(const RnnConfig& config) {
   for (int width : config.hidden) require_positive(width, "hidden");
 }
 
+void validate(const TransformerConfig& config) {
+  require_positive(config.vocab_size, "vocab_size");
+  require_positive(config.d_model, "d_model");
+  require_positive(config.num_heads, "num_heads");
+  require_positive(config.num_layers, "num_layers");
+  require_positive(config.d_ff, "d_ff");
+  require_positive(config.max_seq_len, "max_seq_len");
+  if (config.d_model % config.num_heads != 0) bad("num_heads");
+  if (!(config.dropout >= 0.f) || !(config.dropout < 1.f)) bad("dropout");
+  if (config.tie_embeddings) bad("tie_embeddings");
+  if (config.activation != TransformerActivation::Gelu &&
+      config.activation != TransformerActivation::SwiGLU) {
+    bad("activation");
+  }
+  if (config.positional == PositionalEncoding::Rope) bad("use_rope");
+  if (config.positional != PositionalEncoding::LearnedAbsolute) bad("positional");
+  if (config.activation == TransformerActivation::SwiGLU && config.d_ff > INT_MAX / 2) bad("d_ff");
+}
+
 }  // namespace nn

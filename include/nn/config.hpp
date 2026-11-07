@@ -65,6 +65,23 @@ struct RnnConfig {
   int output_size = 0;
 };
 
+enum class TransformerActivation : uint32_t { Gelu = 1, SwiGLU = 2 };
+enum class PositionalEncoding : uint32_t { LearnedAbsolute = 1, Rope = 2 };
+
+struct TransformerConfig {
+  int vocab_size = 0;
+  int d_model = 0;
+  int num_heads = 0;
+  int num_layers = 0;
+  int d_ff = 0;              // post-gate width H; SwiGLU fc1 writes 2H
+  int max_seq_len = 0;
+  float dropout = 0.f;
+  bool tie_embeddings = false;  // v1: must be false; validate throws if true
+  bool bias = false;
+  TransformerActivation activation = TransformerActivation::SwiGLU;
+  PositionalEncoding positional = PositionalEncoding::LearnedAbsolute;
+};
+
 int conv_out_size(int in, int kernel, int stride, int pad);
 
 void validate(const MlpConfig& config);
@@ -72,5 +89,6 @@ void validate(const ConvConfig& config);
 void validate(const ResNetConfig& config);
 void validate(const ConvResNetConfig& config);
 void validate(const RnnConfig& config);
+void validate(const TransformerConfig& config);
 
 }  // namespace nn

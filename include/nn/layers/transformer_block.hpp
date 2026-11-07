@@ -1,9 +1,9 @@
 #pragma once
 
+#include "nn/config.hpp"
 #include "nn/layer.hpp"
 #include "nn/layers/multi_head_attention.hpp"
 
-#include <cstdint>
 #include <memory>
 #include <optional>
 #include <random>
@@ -13,8 +13,6 @@ namespace nn {
 class LayerNorm;
 class Dropout;
 class Linear;
-
-enum class TransformerActivation : uint32_t { Gelu = 1, SwiGLU = 2 };
 
 struct TransformerBlockSpec {
   int d_model = 0;

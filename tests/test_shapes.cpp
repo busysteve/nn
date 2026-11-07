@@ -1167,6 +1167,62 @@ int test_shapes() {
     expect_invalid([&] { nn::validate(config); }, "hidden");
   }
 
+  {
+    nn::TransformerConfig config;
+    config.vocab_size = 10;
+    config.d_model = 8;
+    config.num_heads = 2;
+    config.num_layers = 1;
+    config.d_ff = 16;
+    config.max_seq_len = 4;
+    config.dropout = 0.f;
+    config.bias = false;
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.positional = nn::PositionalEncoding::LearnedAbsolute;
+    config.tie_embeddings = true;
+    expect_invalid([&] { nn::validate(config); }, "tie_embeddings");
+    expect_invalid([&] { nn::build_transformer_network(ctx, config, 1); }, "tie_embeddings");
+
+    config.tie_embeddings = false;
+    config.positional = nn::PositionalEncoding::Rope;
+    expect_invalid([&] { nn::validate(config); }, "use_rope");
+    config.positional = static_cast<nn::PositionalEncoding>(0);
+    expect_invalid([&] { nn::validate(config); }, "positional");
+    config.positional = nn::PositionalEncoding::LearnedAbsolute;
+    config.dropout = 1.f;
+    expect_invalid([&] { nn::validate(config); }, "dropout");
+    config.dropout = std::nanf("");
+    expect_invalid([&] { nn::validate(config); }, "dropout");
+    config.dropout = 0.f;
+    config.num_heads = 3;
+    expect_invalid([&] { nn::validate(config); }, "num_heads");
+    config.num_heads = 2;
+    config.activation = static_cast<nn::TransformerActivation>(0);
+    expect_invalid([&] { nn::validate(config); }, "activation");
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.d_ff = std::numeric_limits<int>::max();
+    expect_invalid([&] { nn::validate(config); }, "d_ff");
+    config.activation = nn::TransformerActivation::Gelu;
+    nn::validate(config);
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.d_ff = 16;
+
+    nn::Network net = nn::build_transformer_network(ctx, config, 1);
+    CHECK(net.family() == nn::Family::Transformer);
+    CHECK(has_param(net, "blocks.0.ln1.weight"));
+    CHECK(has_param(net, "final_ln.weight"));
+    CHECK(has_param(net, "final_ln.bias"));
+    CHECK(has_param(net, "lm_head.weight"));
+    CHECK(!has_param(net, "lm_head.bias"));
+    CHECK(find_param(net, "blocks.0.fc1.weight")->shape() == std::vector<int>({32, 8}));
+    CHECK(find_param(net, "lm_head.weight")->shape() == std::vector<int>({10, 8}));
+    for (const nn::NamedParam& param : net.parameters()) {
+      CHECK(param.name.find("tok_emb") == std::string::npos);
+    }
+    check_io(ctx, net, {1, 3, 8}, {1, 3, 10});
+    check_io(ctx, net, {1, 5, 8}, {1, 5, 10});
+  }
+
   CHECK(nn::conv_out_size(28, 5, 1, 2) == 28);
   CHECK(nn::conv_out_size(28, 2, 2, 0) == 14);
   CHECK(nn::conv_out_size(14, 5, 1, 2) == 14);

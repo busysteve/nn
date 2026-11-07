@@ -45,7 +45,7 @@ net.save("mlp.bin", nullptr);
 
 Weight and bias gradients accumulate. Call `zero_grad` once per step. A new network is in train mode. Call `eval()` before inference when the network contains batch-norm or dropout.
 
-For an image network, `input` is rank 4: `(N, in_channels, in_height, in_width)`. For a recurrent network, `input` is rank 3: `(N, T, input_size)`. `build_rnn` returns logits of shape `(N, output_size)`.
+For an image network, `input` is rank 4: `(N, in_channels, in_height, in_width)`. For a recurrent network, `input` is rank 3: `(N, T, input_size)`. `build_rnn` returns logits of shape `(N, output_size)`. For a transformer trunk, `input` is a float tensor `(N, T, d_model)`. `build_transformer_network` returns `(N, T, vocab_size)`.
 
 ## Error
 
@@ -475,8 +475,6 @@ The layer owns four `Linear` children, each `d_model` to `d_model`, constructed 
 Header: `nn/layers/transformer_block.hpp`
 
 ```cpp
-enum class TransformerActivation : uint32_t { Gelu = 1, SwiGLU = 2 };
-
 struct TransformerBlockSpec {
   int d_model = 0;
   int num_heads = 0;
@@ -490,6 +488,8 @@ struct TransformerBlockSpec {
 TransformerBlock(Context& ctx, const TransformerBlockSpec& spec, std::mt19937& rng);
 MultiHeadAttention& attn();
 ```
+
+`TransformerActivation` is defined once in `nn/config.hpp` and included by this header.
 
 Pre-norm block. There is no fourth constructor argument. `d_model`, `num_heads`, and `d_ff` are at least 1, and `d_model` must be divisible by `num_heads` (`TransformerBlock size`). `dropout` is in `[0, 1)` (`TransformerBlock dropout`). Any other `activation` throws `TransformerBlock activation`. `use_rope` is passed through to causal `MultiHeadAttention`; `true` throws `std::invalid_argument` with message `use_rope`.
 
@@ -722,17 +722,58 @@ nn::Tensor sequence(ctx, {32, 10, 8});
 const nn::Tensor& logits = net.forward(sequence);  // (32, 3)
 ```
 
+### TransformerConfig
+
+```cpp
+enum class TransformerActivation : uint32_t { Gelu = 1, SwiGLU = 2 };
+enum class PositionalEncoding : uint32_t { LearnedAbsolute = 1, Rope = 2 };
+
+struct TransformerConfig {
+  int vocab_size = 0;
+  int d_model = 0;
+  int num_heads = 0;
+  int num_layers = 0;
+  int d_ff = 0;
+  int max_seq_len = 0;
+  float dropout = 0.f;
+  bool tie_embeddings = false;
+  bool bias = false;
+  TransformerActivation activation = TransformerActivation::SwiGLU;
+  PositionalEncoding positional = PositionalEncoding::LearnedAbsolute;
+};
+```
+
+`validate` requires `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, and `max_seq_len` to be at least 1. `d_model % num_heads != 0` throws `num_heads`. `dropout` must be in `[0, 1)`, or the call throws `dropout`. `tie_embeddings == true` throws `tie_embeddings`. `activation` is `Gelu` or `SwiGLU`; any other value throws `activation`. `positional == LearnedAbsolute` is accepted. `Rope` throws `use_rope`. Any other value throws `positional`. When `activation` is SwiGLU and `2 * d_ff` does not fit in a positive `int`, `validate` throws `d_ff`. GELU does not double `d_ff`.
+
+`Family::Transformer` is `6`. `build_transformer_network` emits `num_layers` `TransformerBlock`s named `blocks.i`, then `LayerNorm` named `final_ln` (default eps `1e-5`), then `Linear` named `lm_head` from `d_model` to `vocab_size`. The trunk is those blocks, the final LayerNorm, and `lm_head`. It does not own token embeddings or a position table. Each block is built with `use_rope` false. `max_seq_len` is stored on the config and in the checkpoint only.
+
+Forward input is a float tensor `(N, T, d_model)`. Output is `(N, T, vocab_size)`. The trunk does not check `T` against `max_seq_len`.
+
+Random draws follow construction order. For each block, `blocks.i.attn.q.weight`, `k.weight`, `v.weight`, and `out.weight` are drawn, then `blocks.i.fc1.weight` and `blocks.i.fc2.weight`. `lm_head.weight` is drawn last. Layer-norm scale is filled with 1 and does not consume the generator.
+
+```cpp
+config.vocab_size = 10;
+config.d_model = 8;
+config.num_heads = 2;
+config.num_layers = 1;
+config.d_ff = 16;
+config.max_seq_len = 4;
+nn::Network net = nn::build_transformer_network(ctx, config, /*seed=*/1);
+nn::Tensor hidden(ctx, {1, 3, 8});
+const nn::Tensor& logits = net.forward(hidden);  // (1, 3, 10)
+```
+
 ## Network
 
 Header: `nn/network.hpp`
 
 ```cpp
-enum class Family : uint32_t { Mlp = 1, Conv = 2, ResNet = 3, ConvResNet = 4, Rnn = 5 };
+enum class Family : uint32_t { Mlp = 1, Conv = 2, ResNet = 3, ConvResNet = 4, Rnn = 5, Transformer = 6 };
 
 class Network {
  public:
   Network(Context& ctx, Family family, std::vector<std::unique_ptr<Layer>> layers,
-          std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig> config);
+          std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig, TransformerConfig> config);
 
   const Tensor& forward(const Tensor& input);
   const Tensor& backward(const Tensor& grad_output);
@@ -741,7 +782,7 @@ class Network {
   void eval();
   bool training() const;
   Family family() const;
-  const std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig>& config() const;
+  const std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig, TransformerConfig>& config() const;
 
   std::vector<NamedParam> parameters() const;
   std::vector<NamedBuffer> buffers() const;
@@ -765,6 +806,7 @@ Network build_conv(Context& ctx, const ConvConfig& config, uint32_t seed);
 Network build_resnet(Context& ctx, const ResNetConfig& config, uint32_t seed);
 Network build_conv_resnet(Context& ctx, const ConvResNetConfig& config, uint32_t seed);
 Network build_rnn(Context& ctx, const RnnConfig& config, uint32_t seed);
+Network build_transformer_network(Context& ctx, const TransformerConfig& config, uint32_t seed);
 ```
 
 `Network` is movable and not copyable. The usual construction is a builder. Each builder validates the config, seeds one `std::mt19937`, and returns a network in train mode. `load` rebuilds with seed 0 and then overwrites every parameter from the file, so the seed used at load time leaves the restored weights unchanged.
@@ -775,9 +817,9 @@ Network build_rnn(Context& ctx, const RnnConfig& config, uint32_t seed);
 
 `zero_grad()` zeros every parameter gradient. It leaves parameters, velocity, and batch-norm buffers unchanged.
 
-`config()` returns the variant stored at construction. Read it with `std::get<MlpConfig>`, `std::get<ConvConfig>`, `std::get<ResNetConfig>`, `std::get<ConvResNetConfig>`, or `std::get<RnnConfig>`.
+`config()` returns the variant stored at construction. Read it with `std::get<MlpConfig>`, `std::get<ConvConfig>`, `std::get<ResNetConfig>`, `std::get<ConvResNetConfig>`, `std::get<RnnConfig>`, or `std::get<TransformerConfig>`.
 
-The public constructor is for a caller who already owns the layers. `save` writes `family` and `config`. `load` rebuilds with the builder for that family, then requires the parameter and batch-norm records to match that builder's names and shapes. A checkpoint round-trip is defined for a network produced by one of the five builders.
+The public constructor is for a caller who already owns the layers. `save` writes `family` and `config`. `load` rebuilds with the builder for that family, then requires the parameter and batch-norm records to match that builder's names and shapes. A checkpoint round-trip is defined for a network produced by one of the six builders. The file version is still 1.
 
 ## ConvResNet
 
@@ -924,7 +966,7 @@ nn::Network::Loaded resumed = nn::Network::load(ctx, path, nn::LoadMode::Resume)
 | Wrong magic | `bad checkpoint magic` |
 | Version other than 1 | `unsupported checkpoint version N` |
 | Bad train flag, optimizer flag, or reserved word | `bad checkpoint header` |
-| Family outside 1..5 | `bad checkpoint family` |
+| Family outside 1..6 | `bad checkpoint family` |
 | `ConvResNet::load` of another family | `bad checkpoint family` |
 | Parameter or batch-norm record disagrees with the rebuilt network | `checkpoint tensor mismatch: ...` |
 | `Resume` and the optimizer flag is 0 | `optimizer block missing` |

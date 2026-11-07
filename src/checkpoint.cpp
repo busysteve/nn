@@ -208,12 +208,12 @@ Header read_header(ByteReader& reader) {
   if (reserved != 0 || header.training > 1 || header.optimizer_present > 1) {
     throw Error("bad checkpoint header");
   }
-  if (header.family < 1 || header.family > 5) throw Error("bad checkpoint family");
+  if (header.family < 1 || header.family > 6) throw Error("bad checkpoint family");
   return header;
 }
 
-std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig> read_config(ByteReader& reader,
-                                                                                 uint32_t family) {
+std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig, TransformerConfig>
+read_config(ByteReader& reader, uint32_t family) {
   if (family == 1) {
     MlpConfig config;
     config.input_size = reader.i32();
@@ -311,6 +311,23 @@ std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig> r
     if (hidden_count > 1000000u) throw Error("truncated checkpoint");
     config.hidden.resize(hidden_count);
     for (uint32_t i = 0; i < hidden_count; ++i) config.hidden[i] = reader.i32();
+    reader.pad8();
+    validate(config);
+    return config;
+  }
+  if (family == 6) {
+    TransformerConfig config;
+    config.vocab_size = reader.i32();
+    config.d_model = reader.i32();
+    config.num_heads = reader.i32();
+    config.num_layers = reader.i32();
+    config.d_ff = reader.i32();
+    config.max_seq_len = reader.i32();
+    config.dropout = reader.f32();
+    config.tie_embeddings = reader.u32() != 0;
+    config.bias = reader.u32() != 0;
+    config.activation = static_cast<TransformerActivation>(reader.u32());
+    config.positional = static_cast<PositionalEncoding>(reader.u32());
     reader.pad8();
     validate(config);
     return config;
@@ -462,12 +479,24 @@ void Network::save(const std::filesystem::path& path, const Sgd* optimizer) cons
           }
           writer.u32(static_cast<uint32_t>(config.fc.size()));
           for (int width : config.fc) writer.i32(width);
-        } else {
-          static_assert(std::is_same_v<T, RnnConfig>);
+        } else if constexpr (std::is_same_v<T, RnnConfig>) {
           writer.i32(config.input_size);
           writer.i32(config.output_size);
           writer.u32(static_cast<uint32_t>(config.hidden.size()));
           for (int width : config.hidden) writer.i32(width);
+        } else {
+          static_assert(std::is_same_v<T, TransformerConfig>);
+          writer.i32(config.vocab_size);
+          writer.i32(config.d_model);
+          writer.i32(config.num_heads);
+          writer.i32(config.num_layers);
+          writer.i32(config.d_ff);
+          writer.i32(config.max_seq_len);
+          writer.f32(config.dropout);
+          writer.u32(config.tie_embeddings ? 1u : 0u);
+          writer.u32(config.bias ? 1u : 0u);
+          writer.u32(static_cast<uint32_t>(config.activation));
+          writer.u32(static_cast<uint32_t>(config.positional));
         }
       },
       config_);
@@ -552,9 +581,10 @@ Network::Loaded Network::load(Context& ctx, const std::filesystem::path& path, L
         else if constexpr (std::is_same_v<T, ConvConfig>) return build_conv(ctx, cfg, 0);
         else if constexpr (std::is_same_v<T, ResNetConfig>) return build_resnet(ctx, cfg, 0);
         else if constexpr (std::is_same_v<T, ConvResNetConfig>) return build_conv_resnet(ctx, cfg, 0);
+        else if constexpr (std::is_same_v<T, RnnConfig>) return build_rnn(ctx, cfg, 0);
         else {
-          static_assert(std::is_same_v<T, RnnConfig>);
-          return build_rnn(ctx, cfg, 0);
+          static_assert(std::is_same_v<T, TransformerConfig>);
+          return build_transformer_network(ctx, cfg, 0);
         }
       },
       config);

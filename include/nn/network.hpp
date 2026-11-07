@@ -14,12 +14,19 @@
 
 namespace nn {
 
-enum class Family : uint32_t { Mlp = 1, Conv = 2, ResNet = 3, ConvResNet = 4, Rnn = 5 };
+enum class Family : uint32_t {
+  Mlp = 1,
+  Conv = 2,
+  ResNet = 3,
+  ConvResNet = 4,
+  Rnn = 5,
+  Transformer = 6
+};
 
 class Network {
  public:
   Network(Context& ctx, Family family, std::vector<std::unique_ptr<Layer>> layers,
-          std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig> config);
+          std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig, TransformerConfig> config);
   Network(Network&&) noexcept = default;
   Network& operator=(Network&&) noexcept = default;
   Network(const Network&) = delete;
@@ -32,7 +39,7 @@ class Network {
   void eval();
   bool training() const { return training_; }
   Family family() const { return family_; }
-  const std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig>& config() const {
+  const std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig, TransformerConfig>& config() const {
     return config_;
   }
 
@@ -48,7 +55,7 @@ class Network {
   Context* ctx_ = nullptr;
   Family family_ = Family::Mlp;
   std::vector<std::unique_ptr<Layer>> layers_;
-  std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig> config_;
+  std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig, TransformerConfig> config_;
   bool training_ = true;
 };
 

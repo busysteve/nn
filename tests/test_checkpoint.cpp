@@ -255,6 +255,57 @@ int test_checkpoint() {
     CHECK(loaded.network.parameters()[0].value->shape() == std::vector<int>({3, 4}));
   }
   {
+    nn::TransformerConfig config;
+    config.vocab_size = 10;
+    config.d_model = 8;
+    config.num_heads = 2;
+    config.num_layers = 1;
+    config.d_ff = 16;
+    config.max_seq_len = 4;
+    config.dropout = 0.f;
+    config.bias = false;
+    config.tie_embeddings = false;
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.positional = nn::PositionalEncoding::LearnedAbsolute;
+    nn::Network net = nn::build_transformer_network(ctx, config, 1);
+    net.train();
+    nn::Sgd optimizer(net.parameters(), 0.1f, 0.9f);
+    net.zero_grad();
+    nn::Tensor input(ctx, {1, 3, 8});
+    input.copy_from_host(uniform(24, rng));
+    const nn::Tensor& output = net.forward(input);
+    CHECK(output.shape() == std::vector<int>({1, 3, 10}));
+    nn::Tensor grad(ctx, output.shape());
+    grad.copy_from_host(uniform(static_cast<int64_t>(output.numel()), rng));
+    net.backward(grad);
+    optimizer.step();
+    CHECK(optimizer.step_count() == 1);
+    const std::filesystem::path path = dir / "transformer.bin";
+    net.save(path, &optimizer);
+
+    nn::Context ctx_b;
+    nn::Network::Loaded resumed = nn::Network::load(ctx_b, path, nn::LoadMode::Resume);
+    CHECK(resumed.optimizer.has_value());
+    CHECK(resumed.network.family() == nn::Family::Transformer);
+    compare_state(net, resumed.network, optimizer, *resumed.optimizer, false);
+
+    nn::Network::Loaded loaded = nn::Network::load(ctx, path, nn::LoadMode::Inference);
+    CHECK(!loaded.optimizer);
+    CHECK(loaded.network.family() == nn::Family::Transformer);
+    const nn::TransformerConfig& restored = std::get<nn::TransformerConfig>(loaded.network.config());
+    CHECK(restored.vocab_size == config.vocab_size);
+    CHECK(restored.d_model == config.d_model);
+    CHECK(restored.num_heads == config.num_heads);
+    CHECK(restored.num_layers == config.num_layers);
+    CHECK(restored.d_ff == config.d_ff);
+    CHECK(restored.max_seq_len == config.max_seq_len);
+    CHECK(restored.dropout == config.dropout);
+    CHECK(restored.tie_embeddings == false);
+    CHECK(restored.bias == config.bias);
+    CHECK(restored.activation == config.activation);
+    CHECK(restored.positional == config.positional);
+  }
+  {
     nn::ConvConfig config;
     config.in_channels = 1;
     config.in_height = 8;

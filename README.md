@@ -1,6 +1,6 @@
 # nn
 
-A single-GPU C++17 library that builds and trains multilayer perceptrons, convolutional networks, basic-block ResNets, and recurrent networks. `ConvResNet` is one network that can include a conv+pool trunk, residual stages, or both. Depth and width come from a config. Each trainable layer implements its own forward and backward pass. The network chains those layers. An MLP selects ReLU, GELU, or SwiGLU between its hidden linear layers. Training uses mean softmax cross-entropy and SGD with momentum. A checkpoint restores parameters, batch-norm state, the train or eval flag, and, when requested, the optimizer, so a new process can evaluate or resume training.
+A single-GPU C++17 library that builds and trains multilayer perceptrons, convolutional networks, basic-block ResNets, recurrent networks, and a decoder-only transformer trunk. `ConvResNet` is one network that can include a conv+pool trunk, residual stages, or both. Depth and width come from a config. Each trainable layer implements its own forward and backward pass. The network chains those layers. An MLP selects ReLU, GELU, or SwiGLU between its hidden linear layers. Training uses mean softmax cross-entropy and SGD with momentum. A checkpoint restores parameters, batch-norm state, the train or eval flag, and, when requested, the optimizer, so a new process can evaluate or resume training.
 
 The acceptance suite is MNIST. Public headers live under `include/nn/` and do not include CUDA, cuBLAS, or cuDNN headers.
 
@@ -41,7 +41,7 @@ Everything is in namespace `nn`.
 
 ## Classes
 
-`Layer` is the abstract base. `Network` owns an ordered list of layers. A `ResidualBlock` owns the convolutions, batch-norm layers, and ReLUs on its main path and on its projection skip. `GELU` and `SwiGLU` are parameter-free activations. `build_mlp` places `ReLU`, `GELU`, or `SwiGLU` between hidden linear layers. `RNN` is one Elman recurrent layer. `LastStep` keeps the last time index. `ConvResNet` owns one `Network` whose family is `ConvResNet`. `build_mlp`, `build_conv`, `build_resnet`, `build_conv_resnet`, and `build_rnn` are free functions that return one `Network`. `softmax_cross_entropy` is a free function that reads a `Tensor` and a `DeviceIndices` and returns a `LossResult`.
+`Layer` is the abstract base. `Network` owns an ordered list of layers. A `ResidualBlock` owns the convolutions, batch-norm layers, and ReLUs on its main path and on its projection skip. `GELU` and `SwiGLU` are parameter-free activations. `build_mlp` places `ReLU`, `GELU`, or `SwiGLU` between hidden linear layers. `RNN` is one Elman recurrent layer. `LastStep` keeps the last time index. `ConvResNet` owns one `Network` whose family is `ConvResNet`. `build_mlp`, `build_conv`, `build_resnet`, `build_conv_resnet`, `build_rnn`, and `build_transformer_network` are free functions that return one `Network`. `softmax_cross_entropy` is a free function that reads a `Tensor` and a `DeviceIndices` and returns a `LossResult`.
 
 ```mermaid
 classDiagram
@@ -138,6 +138,7 @@ classDiagram
     class ResNetConfig
     class ConvResNetConfig
     class RnnConfig
+    class TransformerConfig
 
     class Network {
         +forward()
@@ -154,6 +155,7 @@ classDiagram
     Network --> ResNetConfig
     Network --> ConvResNetConfig
     Network --> RnnConfig
+    Network --> TransformerConfig
 
     class ConvResNet {
         +forward()
@@ -248,7 +250,7 @@ Call `network.eval()` before inference. Eval batch-norm uses the stored running 
 
 ## Initialization
 
-`build_mlp`, `build_conv`, `build_resnet`, `build_conv_resnet`, and `build_rnn` take a `uint32_t` seed and construct layers with one `std::mt19937`. Each weight tensor draws Kaiming normal values with standard deviation `sqrt(2 / fan_in)` and consumes the generator. Biases are zero and do not consume it. Batch-norm scale is filled with 1, batch-norm bias with 0, running mean with 0, and running variance with 1. The batch counter starts at 0.
+`build_mlp`, `build_conv`, `build_resnet`, `build_conv_resnet`, `build_rnn`, and `build_transformer_network` take a `uint32_t` seed and construct layers with one `std::mt19937`. Each weight tensor draws Kaiming normal values with standard deviation `sqrt(2 / fan_in)` and consumes the generator. Biases are zero and do not consume it. Batch-norm scale is filled with 1, batch-norm bias with 0, running mean with 0, and running variance with 1. The batch counter starts at 0.
 
 Fan-in is `in_features` for `Linear`, `in_channels * kernel * kernel` for `Conv2d`, `input_size` for `RNN` `weight_ih`, and `hidden_size` for `RNN` `weight_hh`.
 
@@ -259,6 +261,7 @@ Generator order follows construction order:
 - ResNet: `stem.weight`, then each block's `conv1.weight`, `conv2.weight`, and `proj.weight` when the block has a projection, then `head.weight`
 - ConvResNet: each `conv.i.weight`, then `stem.weight` when the stem is present, then each block's `conv1.weight`, `conv2.weight`, and `proj.weight` when the block has a projection, then each `fc.i.weight`
 - RNN: for each recurrent layer, `rnn.i.weight_ih` then `rnn.i.weight_hh`, then `head.weight`
+- Transformer: for each block, `blocks.i.attn.q.weight`, `blocks.i.attn.k.weight`, `blocks.i.attn.v.weight`, `blocks.i.attn.out.weight`, then `blocks.i.fc1.weight`, `blocks.i.fc2.weight`; then `lm_head.weight`
 
 `load` rebuilds with seed 0 and then overwrites every parameter from the file. The seed used at load time does not affect the restored weights.
 
@@ -341,6 +344,24 @@ nn::ConvResNet::Loaded loaded = nn::ConvResNet::load(ctx, path, nn::LoadMode::Re
 `build_rnn` emits one `RNN` per hidden width, named `rnn.i`, then `LastStep`, then `Linear` named `head`. The state before the first step is zero and is not a parameter. Each layer reads the full sequence from the layer below. `LastStep` keeps time `T - 1`. The head maps that vector to `output_size`.
 
 Input shape is `(N, T, input_size)`. Output shape is `(N, output_size)`. `T` is at least 1.
+
+### TransformerConfig
+
+| Field | Meaning |
+|---|---|
+| `vocab_size` | `lm_head` output width. At least 1. |
+| `d_model` | Trunk width. At least 1, and divisible by `num_heads`. |
+| `num_heads` | Attention heads. At least 1. A width that is not divisible throws `num_heads`. |
+| `num_layers` | Number of pre-norm blocks. At least 1. |
+| `d_ff` | Feed-forward width after the gate. At least 1. SwiGLU's first linear writes `2 * d_ff`. A product that does not fit in a positive `int` throws `d_ff`. GELU does not double `d_ff`. |
+| `max_seq_len` | Stored on the config and in the checkpoint. At least 1. The trunk forward does not read it. |
+| `dropout` | In `[0, 1)`. Any other value throws `dropout`. |
+| `tie_embeddings` | Must be false. `true` throws `tie_embeddings`. |
+| `bias` | When true, attention projections, the block linears, and `lm_head` have a bias. |
+| `activation` | `TransformerActivation::Gelu` (`1`) or `SwiGLU` (`2`). Any other value throws `activation`. |
+| `positional` | `PositionalEncoding::LearnedAbsolute` (`1`) is accepted. `Rope` (`2`) throws `use_rope`. Any other value throws `positional`. |
+
+`Family::Transformer` is `6`. `validate` checks the fields above. `build_transformer_network` emits one `TransformerBlock` per layer, named `blocks.i`, then `LayerNorm` named `final_ln` (default eps `1e-5`), then `Linear` named `lm_head` from `d_model` to `vocab_size`. The trunk is those blocks, the final LayerNorm, and `lm_head`. It does not own token embeddings or a position table. Each block is built with `use_rope` false. Forward input is a float tensor `(N, T, d_model)`. Output is `(N, T, vocab_size)`. `T` is not checked against `max_seq_len`.
 
 ### MNIST shapes
 
@@ -627,13 +648,13 @@ Magic is `0x314E4E43` (`CNN1` on disk). Version is `1`. Any other version throws
 |---:|---|---|
 | 0 | `uint32` | Magic `0x314E4E43`. |
 | 4 | `uint32` | Version `1`. |
-| 8 | `uint32` | Family: `1` MLP, `2` conv, `3` ResNet, `4` ConvResNet, `5` RNN. |
+| 8 | `uint32` | Family: `1` MLP, `2` conv, `3` ResNet, `4` ConvResNet, `5` RNN, `6` transformer. |
 | 12 | `uint32` | Train flag: `1` train, `0` eval. |
 | 16 | `uint64` | Optimizer step, or 0 when no optimizer is saved. |
 | 24 | `uint32` | `1` when an optimizer block follows, else `0`. |
 | 28 | `uint32` | Reserved. Must be 0. |
 
-A train flag or optimizer flag outside `{0, 1}`, or a non-zero reserved word, throws `bad checkpoint header`. A family outside 1..5 throws `bad checkpoint family`.
+A train flag or optimizer flag outside `{0, 1}`, or a non-zero reserved word, throws `bad checkpoint header`. A family outside 1..6 throws `bad checkpoint family`. Version stays `1`.
 
 ### Config
 
@@ -648,6 +669,8 @@ ResNet: `in_channels`, `in_height`, `in_width`, `stem_channels`, `output_size`, 
 ConvResNet: `in_channels`, `in_height`, `in_width`, `stem_channels`, pool kernel, pool stride, conv count `uint32`, then each conv as `out_channels`, `kernel`, `stride`, `pad`, stage count `uint32`, then each stage as `blocks_per_stage`, `stage_width`, fully-connected count `uint32`, and those widths. Pool fields are stored even when `convs` is empty.
 
 RNN: `input_size`, `output_size`, hidden count `uint32`, then that many widths.
+
+Transformer (`6`): `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, `max_seq_len` (`int32`), `dropout` (float32), then `tie_embeddings`, `bias`, `activation`, and `positional` (`uint32`). The two flags are `0` or `1`. `activation` is `1` GELU or `2` SwiGLU. `positional` is `1` learned absolute. The same version-1 layout follows: pad to 8 bytes, then parameter records, then a batch-norm count of 0.
 
 `load` runs `validate` on the decoded config and then the same builder that created the network.
 
@@ -703,7 +726,7 @@ A count or numel mismatch throws `optimizer state mismatch`.
 | Wrong magic | `bad checkpoint magic` |
 | Version other than 1 | `unsupported checkpoint version N` |
 | Bad flag or reserved word | `bad checkpoint header` |
-| Family outside 1..5, or `ConvResNet::load` of another family | `bad checkpoint family` |
+| Family outside 1..6, or `ConvResNet::load` of another family | `bad checkpoint family` |
 | Name longer than 256 | `checkpoint tensor mismatch: name` |
 | Parameter or batch-norm record disagrees with the rebuilt network | `checkpoint tensor mismatch: ...` |
 | `Resume` and the optimizer flag is 0 | `optimizer block missing` |
@@ -773,7 +796,7 @@ CTest timeouts are 900 seconds for `shapes`, `grads`, and `ckpt`, and 7200 secon
 
 Images are scaled by `1/255` into `[0, 1]`. Labels are `int64` class indices. The loader is part of the test binary, not the library.
 
-`shapes` checks forward and backward ranks for several depths and widths of each family, including a ResNet stage that downsamples, a stage that uses a projection, a ConvResNet with a conv trunk, a stem, and residual stages, MLP networks that use GELU and SwiGLU, and an RNN.
+`shapes` checks forward and backward ranks for several depths and widths of each family, including a ResNet stage that downsamples, a stage that uses a projection, a ConvResNet with a conv trunk, a stem, and residual stages, MLP networks that use GELU and SwiGLU, an RNN, and a transformer trunk.
 
 `grads` compares analytic backward with central finite differences at epsilon `1e-3`, including GELU, SwiGLU, and an RNN. Parameter gradients pass when the relative error is at most `1e-2` or the absolute error is at most `1e-4`. Softmax cross-entropy uses relative `1e-5` on the scalar loss and relative `1e-4` on `grad_logits`.
 
@@ -793,6 +816,6 @@ At the start of the ResNet's last epoch the test zeros every `running_mean`, fil
 
 ## Scope
 
-The library is a fixed set of layers with manual backward passes, five builders, one loss, one optimizer, and one checkpoint version. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
+The library is a fixed set of layers with manual backward passes, six builders, one loss, one optimizer, and one checkpoint version. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
 
-It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, ConvResNet models that can include a conv trunk, residual stages, or both, and Elman RNNs. Conv, ResNet, and ConvResNet builders use ReLU. The training set exercised by the suite is MNIST.
+It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, ConvResNet models that can include a conv trunk, residual stages, or both, Elman RNNs, and a decoder-only transformer trunk of blocks, a final LayerNorm, and `lm_head`. That trunk reads a float tensor `(N, T, d_model)`. Conv, ResNet, and ConvResNet builders use ReLU. The training set exercised by the suite is MNIST.
