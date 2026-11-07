@@ -134,6 +134,65 @@ nn::AdamW make_adamw(nn::Network& net) {
                    1e-8f);
 }
 
+void step_facade_adamw(nn::Transformer& model, nn::AdamW& opt, nn::Context& ctx) {
+  const std::vector<int64_t> ids = {1, 0, 1};
+  const std::vector<int64_t> labels = {0, 1, 2};
+  model.train();
+  model.zero_grad();
+  nn::IndexTensor tokens(ctx, {1, 3});
+  nn::IndexTensor label_ids(ctx, {1, 3});
+  tokens.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
+  label_ids.copy_from_host(labels.data(), static_cast<int64_t>(labels.size()));
+  ctx.synchronize();
+  const nn::Tensor& logits = model.forward(tokens);
+  nn::LossResult loss = nn::sequence_cross_entropy(ctx, logits, label_ids, -100);
+  model.backward(loss.grad_logits);
+  opt.step();
+}
+
+nn::AdamW make_facade_adamw(nn::Transformer& model) {
+  std::vector<nn::AdamWGroup> groups;
+  for (const nn::NamedParam& param : model.parameters()) {
+    const bool decay = param.value->rank() == 2 && param.name.find("ln") == std::string::npos;
+    const float weight_decay = decay ? 0.05f : 0.f;
+    if (groups.empty() || groups.back().weight_decay != weight_decay) {
+      nn::AdamWGroup group;
+      group.weight_decay = weight_decay;
+      groups.push_back(std::move(group));
+    }
+    groups.back().params.push_back(param);
+  }
+  return nn::AdamW(std::move(groups), 1e-2f, 0.9f, 0.95f, 1e-8f);
+}
+
+void compare_facade_adamw(const nn::Transformer& left, const nn::Transformer& right,
+                          const nn::AdamW& left_opt, const nn::AdamW& right_opt) {
+  const std::vector<nn::NamedParam> a = left.parameters();
+  const std::vector<nn::NamedParam> b = right.parameters();
+  CHECK(a.size() == b.size());
+  for (size_t i = 0; i < a.size(); ++i) {
+    CHECK(a[i].name == b[i].name);
+    expect_bits(a[i].value->to_host(), b[i].value->to_host(), a[i].name.c_str());
+  }
+  CHECK(left_opt.step_count() == right_opt.step_count());
+  CHECK(left_opt.learning_rate() == right_opt.learning_rate());
+  CHECK(left_opt.beta1() == right_opt.beta1());
+  CHECK(left_opt.beta2() == right_opt.beta2());
+  CHECK(left_opt.eps() == right_opt.eps());
+  CHECK(left_opt.groups().size() == right_opt.groups().size());
+  CHECK(left_opt.groups().size() >= 2);
+  for (size_t g = 0; g < left_opt.groups().size(); ++g) {
+    CHECK(left_opt.groups()[g].weight_decay == right_opt.groups()[g].weight_decay);
+    CHECK(left_opt.groups()[g].params.size() == right_opt.groups()[g].params.size());
+  }
+  CHECK(left_opt.m().size() == right_opt.m().size());
+  CHECK(left_opt.v().size() == right_opt.v().size());
+  for (size_t i = 0; i < left_opt.m().size(); ++i) {
+    expect_bits(left_opt.m()[i].to_host(), right_opt.m()[i].to_host(), "m");
+    expect_bits(left_opt.v()[i].to_host(), right_opt.v()[i].to_host(), "v");
+  }
+}
+
 void compare_adamw(const nn::Network& left, const nn::Network& right, const nn::AdamW& left_opt,
                    const nn::AdamW& right_opt) {
   const std::vector<nn::NamedParam> a = left.parameters();
@@ -418,6 +477,7 @@ int test_checkpoint() {
     nn::Context ctx_b;
     nn::Transformer::Loaded resumed = nn::Transformer::load(ctx_b, path, nn::LoadMode::Resume);
     CHECK(resumed.optimizer.has_value());
+    CHECK(!resumed.adamw.has_value());
     CHECK(resumed.step == 1);
     CHECK(resumed.model.network().family() == nn::Family::Transformer);
     const std::vector<nn::NamedParam> left = model.parameters();
@@ -446,6 +506,7 @@ int test_checkpoint() {
     nn::Transformer::Loaded loaded =
         nn::Transformer::load(ctx, infer_path, nn::LoadMode::Inference);
     CHECK(!loaded.optimizer);
+    CHECK(!loaded.adamw);
     CHECK(loaded.step == 0);
     const nn::TransformerConfig& restored =
         std::get<nn::TransformerConfig>(loaded.model.network().config());
@@ -708,6 +769,72 @@ int test_checkpoint() {
     nn::Network::Loaded inferred = nn::Network::load(ctx, dir / "v2noopt.bin", nn::LoadMode::Inference);
     CHECK(!inferred.optimizer.has_value());
     CHECK(!inferred.adamw.has_value());
+  }
+  {
+    nn::TransformerConfig config;
+    config.vocab_size = 10;
+    config.d_model = 8;
+    config.num_heads = 2;
+    config.num_layers = 1;
+    config.d_ff = 16;
+    config.max_seq_len = 4;
+    config.dropout = 0.f;
+    config.bias = false;
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.positional = nn::PositionalEncoding::LearnedAbsolute;
+    nn::Transformer model(ctx, config, 1);
+    {
+      const std::vector<nn::NamedParam> params = model.parameters();
+      nn::AdamWGroup late;
+      late.weight_decay = 0.05f;
+      late.params.assign(params.begin() + 1, params.end());
+      nn::AdamWGroup early;
+      early.weight_decay = 0.f;
+      early.params.push_back(params.front());
+      nn::AdamW swapped(
+          std::vector<nn::AdamWGroup>{std::move(late), std::move(early)}, 1e-2f, 0.9f, 0.95f, 1e-8f);
+      expect_throw([&] { model.save(dir / "facade-adamw-order.bin", &swapped); },
+                   "optimizer does not belong to this network");
+    }
+
+    nn::AdamW optimizer = make_facade_adamw(model);
+    CHECK(optimizer.groups().size() >= 2);
+    step_facade_adamw(model, optimizer, ctx);
+    CHECK(optimizer.step_count() == 1);
+    bool nonzero = false;
+    for (float value : optimizer.m()[0].to_host()) nonzero = nonzero || value != 0.f;
+    CHECK(nonzero);
+
+    const std::filesystem::path path = dir / "facade-adamw.bin";
+    model.save(path, &optimizer);
+    const std::vector<uint8_t> saved = read_bytes(path);
+    CHECK(read_u32(saved, 4) == 2);
+    CHECK(read_u32(saved, 8) == 6);
+    CHECK(read_u32(saved, 24) == 1);
+
+    nn::Context ctx_b;
+    nn::Transformer::Loaded resumed = nn::Transformer::load(ctx_b, path, nn::LoadMode::Resume);
+    CHECK(resumed.adamw.has_value());
+    CHECK(!resumed.optimizer.has_value());
+    CHECK(resumed.step == 1);
+    compare_facade_adamw(model, resumed.model, optimizer, *resumed.adamw);
+
+    step_facade_adamw(model, optimizer, ctx);
+    step_facade_adamw(resumed.model, *resumed.adamw, ctx_b);
+    CHECK(optimizer.step_count() == 2);
+    compare_facade_adamw(model, resumed.model, optimizer, *resumed.adamw);
+
+    nn::Transformer::Loaded inferred = nn::Transformer::load(ctx, path, nn::LoadMode::Inference);
+    CHECK(!inferred.optimizer.has_value());
+    CHECK(!inferred.adamw.has_value());
+    CHECK(inferred.step == 1);
+
+    model.save(dir / "facade-adamw-null.bin", static_cast<const nn::AdamW*>(nullptr));
+    const std::vector<uint8_t> empty_opt = read_bytes(dir / "facade-adamw-null.bin");
+    CHECK(read_u32(empty_opt, 4) == 2);
+    CHECK(read_u32(empty_opt, 24) == 0);
+    expect_throw([&] { nn::Transformer::load(ctx, dir / "facade-adamw-null.bin", nn::LoadMode::Resume); },
+                 "optimizer block missing");
   }
 
   std::printf("ckpt ok\n");

@@ -25,6 +25,7 @@ class Tensor {
 
   void zero();
   void fill(float value);
+  void scale(float factor);
   void copy_from(const Tensor& src);
   void copy_from_host(const float* src, int64_t n);
   void copy_from_host(const std::vector<float>& src);

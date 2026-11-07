@@ -45,6 +45,11 @@ class Transformer {
   const Network& network() const;
 
   void save(const std::filesystem::path& path, const Sgd* optimizer) const;
+  void save(const std::filesystem::path& path, const AdamW* optimizer) const;
+  // nullptr stays version 1. An AdamW* (including null) is version 2.
+  void save(const std::filesystem::path& path, std::nullptr_t) const {
+    save(path, static_cast<const Sgd*>(nullptr));
+  }
 
   struct Loaded;
   static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
@@ -70,6 +75,7 @@ struct Transformer::Loaded {
   Transformer model;
   std::optional<Sgd> optimizer;
   uint64_t step = 0;
+  std::optional<AdamW> adamw;
 };
 
 }  // namespace nn

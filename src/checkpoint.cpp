@@ -841,6 +841,36 @@ void Transformer::save(const std::filesystem::path& path, const Sgd* optimizer) 
   commit_checkpoint(path, writer.bytes());
 }
 
+void Transformer::save(const std::filesystem::path& path, const AdamW* optimizer) const {
+  // Resume splits parameters() by stored group sizes, so groups must be that order.
+  if (optimizer) {
+    const std::vector<NamedParam> mine = parameters();
+    const std::vector<NamedParam> theirs = flat_params(*optimizer);
+    if (mine.size() != theirs.size()) throw Error("optimizer does not belong to this network");
+    for (size_t i = 0; i < mine.size(); ++i) {
+      if (mine[i].value != theirs[i].value) throw Error("optimizer does not belong to this network");
+    }
+  }
+  ctx_->synchronize();
+  const std::vector<NamedParam> params = parameters();
+  const TransformerConfig& config = std::get<TransformerConfig>(network().config());
+
+  ByteWriter writer;
+  writer.u32(kMagic);
+  writer.u32(kVersionAdamW);
+  writer.u32(static_cast<uint32_t>(network().family()));
+  writer.u32(training() ? 1u : 0u);
+  writer.u64(optimizer ? optimizer->step_count() : 0);
+  writer.u32(optimizer ? 1u : 0u);
+  writer.u32(0);
+  write_transformer_config(writer, config);
+  writer.pad8();
+  write_params(writer, params);
+  write_bn(writer, {});
+  if (optimizer) write_optimizer_adamw(writer, *optimizer);
+  commit_checkpoint(path, writer.bytes());
+}
+
 Transformer::Loaded Transformer::load(Context& ctx, const std::filesystem::path& path, LoadMode mode) {
   ByteReader reader(read_file(path));
   const Header header = read_header(reader, 2u);
@@ -852,14 +882,18 @@ Transformer::Loaded Transformer::load(Context& ctx, const std::filesystem::path&
   const std::vector<ParsedBn> parsed_bn = read_bn(reader);
   if (!parsed_bn.empty()) throw Error("checkpoint tensor mismatch: batch-norm buffers");
   std::optional<ParsedOpt> parsed_opt;
+  std::optional<ParsedAdamW> parsed_adamw;
   if (header.optimizer_present) {
     if (header.version == 2u) {
       const uint32_t kind = reader.u32();
-      if (kind != kKindSgd) throw Error("unsupported optimizer kind");
+      if (kind == kKindSgd) parsed_opt = read_opt(reader, parsed_params);
+      else if (kind == kKindAdamW) parsed_adamw = read_adamw(reader, parsed_params);
+      else throw Error("unsupported optimizer kind " + std::to_string(kind));
+    } else {
+      parsed_opt = read_opt(reader, parsed_params);
     }
-    parsed_opt = read_opt(reader, parsed_params);
   }
-  if (mode == LoadMode::Resume && !parsed_opt) throw Error("optimizer block missing");
+  if (mode == LoadMode::Resume && !parsed_opt && !parsed_adamw) throw Error("optimizer block missing");
 
   Transformer model(ctx, config, 0);
   const std::vector<NamedParam> params = model.parameters();
@@ -870,13 +904,37 @@ Transformer::Loaded Transformer::load(Context& ctx, const std::filesystem::path&
   else model.eval();
 
   Loaded loaded{std::move(model), std::nullopt, header.step};
-  if (mode == LoadMode::Resume) {
+  if (mode == LoadMode::Resume && parsed_opt) {
     Sgd optimizer(loaded.model.parameters(), parsed_opt->learning_rate, parsed_opt->momentum);
     for (size_t i = 0; i < parsed_opt->velocity.size(); ++i) {
       optimizer.velocity()[i].copy_from_host(parsed_opt->velocity[i]);
     }
     optimizer.set_step_count(header.step);
     loaded.optimizer = std::move(optimizer);
+  } else if (mode == LoadMode::Resume && parsed_adamw) {
+    const std::vector<NamedParam> live = loaded.model.parameters();
+    std::vector<AdamWGroup> groups;
+    groups.reserve(parsed_adamw->groups.size());
+    size_t cursor = 0;
+    for (const ParsedAdamGroup& group : parsed_adamw->groups) {
+      AdamWGroup built;
+      built.weight_decay = group.weight_decay;
+      built.params.reserve(group.m.size());
+      for (size_t i = 0; i < group.m.size(); ++i) built.params.push_back(live[cursor + i]);
+      cursor += group.m.size();
+      groups.push_back(std::move(built));
+    }
+    AdamW adamw(std::move(groups), parsed_adamw->lr, parsed_adamw->beta1, parsed_adamw->beta2,
+                parsed_adamw->eps);
+    size_t flat = 0;
+    for (const ParsedAdamGroup& group : parsed_adamw->groups) {
+      for (size_t i = 0; i < group.m.size(); ++i, ++flat) {
+        adamw.m()[flat].copy_from_host(group.m[i]);
+        adamw.v()[flat].copy_from_host(group.v[i]);
+      }
+    }
+    adamw.set_step_count(header.step);
+    loaded.adamw = std::move(adamw);
   }
   ctx.synchronize();
   return loaded;

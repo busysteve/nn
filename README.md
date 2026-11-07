@@ -392,7 +392,7 @@ const nn::Tensor& hooked = model.forward(hidden);  // float (N, T, d_model) -> (
 
 `parameters()` is `tok_emb.weight`, then `pos_emb.weight`, then `network().parameters()` (`blocks.0.ln1.weight`, ..., `final_ln.weight`, `lm_head.weight`). `network().parameters()` does not include `tok_emb`.
 
-`save(path, nullptr)` writes version 1, family 6, no optimizer block, and those parameters, including `tok_emb.weight` and `pos_emb.weight`. `save(path, sgd)` writes version 2 with `optimizer_present` 1 and optimizer kind `1` (SGD) followed by the SGD body. `load` in `LoadMode::Resume` restores that SGD into `Loaded::optimizer`. `LoadMode::Inference` leaves `optimizer` empty. A version-2 kind other than 1 throws. `Network::load` accepts version 1 and version 2. A façade file fails that load on parameter count because the trunk has no embeddings.
+`save(path, nullptr)` writes version 1, family 6, no optimizer block, and those parameters, including `tok_emb.weight` and `pos_emb.weight`. `save(path, sgd)` writes version 2 with `optimizer_present` 1 and optimizer kind `1` (SGD) followed by the SGD body. `save(path, adamw)` writes version 2 with optimizer kind `2` (AdamW) and the AdamW moments. The flattened groups must be `parameters()` in order. `save(path, static_cast<const AdamW*>(nullptr))` writes version 2 with `optimizer_present` 0 and no optimizer block. `load` in `LoadMode::Resume` restores SGD into `Loaded::optimizer` or AdamW into `Loaded::adamw`, and leaves the other empty. `LoadMode::Inference` leaves both empty. A version-2 kind other than 1 or 2 throws `unsupported optimizer kind N`. `Network::load` accepts version 1 and version 2. A façade file fails that load on parameter count because the trunk has no embeddings.
 
 ### MNIST shapes
 
@@ -673,14 +673,14 @@ The file is little-endian. Sections are padded to 8 bytes. Strings are a `uint32
 
 The file does not contain activation caches, gradients, workspaces, or cuDNN descriptors. Descriptors are rebuilt from shapes on the next forward.
 
-Magic is `0x314E4E43` (`CNN1` on disk). `Network::save` writes version `1` for SGD or no optimizer and version `2` for AdamW. `Transformer::save` writes version `1` with no optimizer and version `2` with SGD kind `1`. `Network::load` accepts version 1 and version 2. Any other version throws `unsupported checkpoint version N`. Version 2 keeps this header. When the optimizer flag is set, the optimizer block starts with `optimizer_kind` (`uint32`, `1` SGD or `2` AdamW). An unknown kind throws `unsupported optimizer kind N`.
+Magic is `0x314E4E43` (`CNN1` on disk). `Network::save` writes version `1` for SGD or no optimizer and version `2` for AdamW. `Transformer::save` writes version `1` for a null `Sgd*` (`nullptr`), version `2` with SGD kind `1`, and version `2` with AdamW kind `2`. A null `AdamW*` is version `2` with no optimizer block. `Network::load` and `Transformer::load` accept version 1 and version 2. Any other version throws `unsupported checkpoint version N`. Version 2 keeps this header. When the optimizer flag is set, the optimizer block starts with `optimizer_kind` (`uint32`, `1` SGD or `2` AdamW). An unknown kind throws `unsupported optimizer kind N`.
 
 ### Header (32 bytes)
 
 | Offset | Type | Meaning |
 |---:|---|---|
 | 0 | `uint32` | Magic `0x314E4E43`. |
-| 4 | `uint32` | Version. `1` for SGD or no optimizer. `2` for AdamW (`Network::save`) or for a `Transformer` saved with SGD. |
+| 4 | `uint32` | Version. `1` for SGD or no optimizer. `2` for AdamW, for a `Transformer` saved with SGD, or for a `Transformer` saved with a null `AdamW*`. |
 | 8 | `uint32` | Family: `1` MLP, `2` conv, `3` ResNet, `4` ConvResNet, `5` RNN, `6` transformer. |
 | 12 | `uint32` | Train flag: `1` train, `0` eval. |
 | 16 | `uint64` | Optimizer step, or 0 when no optimizer is saved. |
@@ -751,7 +751,7 @@ Present only when the header flag is 1.
 
 A count or numel mismatch throws `optimizer state mismatch`.
 
-`Transformer::save` with an `Sgd*` writes version `2` and, immediately before this body, a `uint32` kind. Kind `1` is SGD. `Transformer::save` with a null optimizer writes version `1` and omits the kind and the body. `Transformer::load` of version 1 reads this body when the optimizer flag is set, with no kind tag. A kind other than `1` throws. Parameter records in a façade file are `tok_emb.weight`, `pos_emb.weight`, then the trunk names.
+`Transformer::save` with an `Sgd*` writes version `2` and, immediately before this body, a `uint32` kind. Kind `1` is SGD. Kind `2` is AdamW and uses the AdamW payload instead of this body. `Transformer::save` with a null `Sgd*` (`nullptr`) writes version `1` and omits the kind and the body. `Transformer::save` with a null `AdamW*` writes version `2` and omits the kind and the body. `Transformer::load` of version 1 reads this body when the optimizer flag is set, with no kind tag. A kind other than `1` or `2` throws `unsupported optimizer kind N`. Resume of kind `2` fills `Loaded::adamw` and leaves `optimizer` empty. Parameter records in a façade file are `tok_emb.weight`, `pos_emb.weight`, then the trunk names.
 
 An SGD payload in version 2 is that same body, after the kind tag.
 

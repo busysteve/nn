@@ -1,6 +1,8 @@
 #include "kernels.hpp"
 
 #include "check.hpp"
+#include "context_impl.hpp"
+#include "nn/tensor.hpp"
 
 namespace nn {
 namespace {
@@ -36,6 +38,11 @@ __global__ void add2_kernel(float* dst, const float* a, const float* b, int64_t 
 __global__ void mul_kernel(float* y, const float* a, const float* b, int64_t n) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n) y[i] = a[i] * b[i];
+}
+
+__global__ void scale_inplace_kernel(float* x, int64_t n, float factor) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) x[i] *= factor;
 }
 
 __device__ float gelu_forward(float x) {
@@ -165,6 +172,12 @@ void launch_mul(cudaStream_t stream, float* y, const float* a, const float* b, i
   if (n <= 0) return;
   mul_kernel<<<blocks_for(n), 256, 0, stream>>>(y, a, b, n);
   check_cuda(cudaGetLastError(), "mul");
+}
+
+void Tensor::scale(float factor) {
+  if (numel_ <= 0) return;
+  scale_inplace_kernel<<<blocks_for(numel_), 256, 0, stream_of(*ctx_)>>>(data_, numel_, factor);
+  check_cuda(cudaGetLastError(), "scale");
 }
 
 void launch_gelu(cudaStream_t stream, float* y, const float* x, int64_t n) {

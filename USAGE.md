@@ -93,6 +93,7 @@ class Tensor {
 
   void zero();
   void fill(float value);
+  void scale(float factor);
   void copy_from(const Tensor& src);
   void copy_from_host(const float* src, int64_t n);
   void copy_from_host(const std::vector<float>& src);
@@ -110,6 +111,8 @@ The shape has rank 1, 2, 3, or 4. Every dimension is at least 1. The element cou
 `copy_from` requires the same element count and throws `tensor copy numel mismatch` otherwise. A source on another context is synchronized before the copy. `copy_from_host` throws `tensor host copy numel mismatch` when `n` or `src.size()` differs from `numel()`.
 
 `to_host()` synchronizes, then copies the tensor to a `std::vector<float>`.
+
+`scale(factor)` multiplies every element in place on the context stream. It does not synchronize.
 
 `reshape` checks that the new shape has the same element count, allocates a new tensor on the same context, and copies. It throws `tensor reshape numel mismatch` when the counts differ.
 
@@ -840,6 +843,7 @@ class Transformer {
   const Network& network() const;
 
   void save(const std::filesystem::path& path, const Sgd* optimizer) const;
+  void save(const std::filesystem::path& path, const AdamW* optimizer) const;
   static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
 };
 
@@ -847,6 +851,7 @@ struct Transformer::Loaded {
   Transformer model;
   std::optional<Sgd> optimizer;
   uint64_t step = 0;
+  std::optional<AdamW> adamw;
 };
 ```
 
@@ -856,7 +861,7 @@ struct Transformer::Loaded {
 
 `parameters()` is `tok_emb.weight`, then `pos_emb.weight`, then `network().parameters()`. `network().parameters()` does not include `tok_emb` or `pos_emb`.
 
-`save(path, nullptr)` writes version 1 with no optimizer block. `save(path, sgd)` writes version 2 and optimizer kind `1` (SGD) before the SGD body. Both files include `tok_emb.weight` and `pos_emb.weight`, then the trunk parameters. `LoadMode::Resume` restores that SGD into `Loaded::optimizer`. `LoadMode::Inference` leaves `optimizer` empty. A version-2 kind other than 1 throws. `Network::load` accepts version 1 and version 2. A façade file fails that load on parameter count because the trunk has no embeddings.
+`save(path, nullptr)` writes version 1 with no optimizer block. `save(path, sgd)` writes version 2 and optimizer kind `1` (SGD) before the SGD body. `save(path, adamw)` writes version 2 and optimizer kind `2` (AdamW) followed by the AdamW moments. The flattened groups must match `parameters()` in order, or save throws `optimizer does not belong to this network`. `save(path, static_cast<const AdamW*>(nullptr))` writes version 2 with `optimizer_present` 0 and no optimizer block. Every façade file includes `tok_emb.weight` and `pos_emb.weight`, then the trunk parameters. `LoadMode::Resume` restores SGD into `Loaded::optimizer` or AdamW into `Loaded::adamw`, and leaves the other empty. `LoadMode::Inference` leaves both empty. A version-2 kind other than 1 or 2 throws `unsupported optimizer kind N`. `Network::load` accepts version 1 and version 2. A façade file fails that load on parameter count because the trunk has no embeddings.
 
 ```cpp
 nn::Transformer model(ctx, config, /*seed=*/1);
@@ -1152,7 +1157,7 @@ Version 2 uses the same 32-byte header with version field `2`. When an optimizer
 | Optimizer record count disagrees | `optimizer state mismatch` |
 | `save` optimizer belongs to other parameters | `optimizer does not belong to this network` |
 
-The byte layout is little-endian, in [README.md](README.md). Version 1 is an SGD checkpoint or a checkpoint with no optimizer. Version 2 is the same header and model records, plus an optimizer kind tag when an optimizer is stored (`1` SGD, `2` AdamW). `Network::save` writes version 2 for AdamW. `Transformer::save` writes version 1 with no optimizer and version 2 with SGD kind 1. The file holds the config, the parameters, the batch-norm running statistics, and, when requested, SGD velocity or AdamW moments. It leaves out activation caches, gradients, workspaces, and cuDNN descriptors. A façade file loaded with `Network::load` fails on parameter count because the trunk has no embeddings.
+The byte layout is little-endian, in [README.md](README.md). Version 1 is an SGD checkpoint or a checkpoint with no optimizer. Version 2 is the same header and model records, plus an optimizer kind tag when an optimizer is stored (`1` SGD, `2` AdamW). `Network::save` writes version 2 for AdamW. `Transformer::save` writes version 1 for `nullptr`, version 2 with SGD kind 1, and version 2 with AdamW kind 2. A null `AdamW*` is version 2 with no optimizer block. The file holds the config, the parameters, the batch-norm running statistics, and, when requested, SGD velocity or AdamW moments. It leaves out activation caches, gradients, workspaces, and cuDNN descriptors. A façade file loaded with `Network::load` fails on parameter count because the trunk has no embeddings.
 
 ## kaiming_normal
 
