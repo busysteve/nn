@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nn/context.hpp"
+#include "nn/index_tensor.hpp"
 #include "nn/tensor.hpp"
 
 #include <cstdint>
@@ -33,5 +34,8 @@ struct LossResult {
 };
 
 LossResult softmax_cross_entropy(Context& ctx, const Tensor& logits, const DeviceIndices& labels);
+
+LossResult sequence_cross_entropy(Context& ctx, const Tensor& logits, const IndexTensor& labels,
+                                  int64_t ignore_index = -100);
 
 }  // namespace nn

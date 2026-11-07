@@ -536,6 +536,97 @@ int test_gradients() {
     finite_difference_at(*params[1].value, pos_grad[pos_index], pos_index, loss, "pos_emb.weight");
   }
 
+  std::printf("grad sequence softmax\n");
+  {
+    constexpr int n = 2;
+    constexpr int t = 3;
+    constexpr int classes = 5;
+    constexpr int rows = n * t;
+    const std::vector<float> host_logits = uniform(static_cast<int64_t>(rows) * classes, rng, -1.f, 1.f);
+    const std::vector<int64_t> host_labels = {0, 2, 4, 1, 3, 0};
+
+    nn::Tensor logits(ctx, {n, t, classes});
+    logits.copy_from_host(host_logits);
+    nn::IndexTensor labels(ctx, {n, t});
+    labels.copy_from_host(host_labels.data(), rows);
+    nn::LossResult seq = nn::sequence_cross_entropy(ctx, logits, labels);
+
+    nn::Tensor flat_logits(ctx, {rows, classes});
+    flat_logits.copy_from_host(host_logits);
+    nn::DeviceIndices flat_labels(ctx, rows);
+    flat_labels.copy_from_host(host_labels.data(), rows);
+    nn::LossResult flat = nn::softmax_cross_entropy(ctx, flat_logits, flat_labels);
+
+    check_close(static_cast<double>(flat.loss), static_cast<double>(seq.loss), 1e-5, -1.0, "seq loss",
+                0);
+    const std::vector<float> seq_grad = seq.grad_logits.to_host();
+    const std::vector<float> flat_grad = flat.grad_logits.to_host();
+    CHECK(seq_grad.size() == flat_grad.size());
+    for (size_t i = 0; i < flat_grad.size(); ++i) {
+      check_close(static_cast<double>(flat_grad[i]), static_cast<double>(seq_grad[i]), 1e-4, -1.0,
+                  "seq grad_logits", i);
+    }
+
+    nn::Tensor row_logits(ctx, {rows, classes});
+    row_logits.copy_from_host(host_logits);
+    nn::IndexTensor row_labels(ctx, {rows});
+    row_labels.copy_from_host(host_labels.data(), rows);
+    nn::LossResult rows_result = nn::sequence_cross_entropy(ctx, row_logits, row_labels);
+    check_close(static_cast<double>(flat.loss), static_cast<double>(rows_result.loss), 1e-5, -1.0,
+                "seq rows loss", 0);
+    const std::vector<float> row_grad = rows_result.grad_logits.to_host();
+    CHECK(row_grad.size() == flat_grad.size());
+    for (size_t i = 0; i < flat_grad.size(); ++i) {
+      check_close(static_cast<double>(flat_grad[i]), static_cast<double>(row_grad[i]), 1e-4, -1.0,
+                  "seq rows grad_logits", i);
+    }
+
+    // Ignored rows are exact zeros. Kept rows match softmax over the kept set, scaled by 1/n_valid.
+    const std::vector<int64_t> mixed_labels = {-100, 2, 4, -100, 3, 0};
+    nn::IndexTensor mixed(ctx, {n, t});
+    mixed.copy_from_host(mixed_labels.data(), rows);
+    nn::LossResult mixed_result = nn::sequence_cross_entropy(ctx, logits, mixed);
+    std::vector<float> kept_logits;
+    std::vector<int64_t> kept_labels;
+    for (int row = 0; row < rows; ++row) {
+      if (mixed_labels[static_cast<size_t>(row)] == -100) continue;
+      kept_labels.push_back(mixed_labels[static_cast<size_t>(row)]);
+      const size_t base = static_cast<size_t>(row) * classes;
+      for (int c = 0; c < classes; ++c) kept_logits.push_back(host_logits[base + static_cast<size_t>(c)]);
+    }
+    nn::Tensor kept(ctx, {static_cast<int>(kept_labels.size()), classes});
+    kept.copy_from_host(kept_logits);
+    nn::DeviceIndices kept_device(ctx, static_cast<int64_t>(kept_labels.size()));
+    kept_device.copy_from_host(kept_labels.data(), static_cast<int64_t>(kept_labels.size()));
+    nn::LossResult kept_loss = nn::softmax_cross_entropy(ctx, kept, kept_device);
+    check_close(static_cast<double>(kept_loss.loss), static_cast<double>(mixed_result.loss), 1e-5, -1.0,
+                "seq mixed loss", 0);
+    const std::vector<float> mixed_grad = mixed_result.grad_logits.to_host();
+    const std::vector<float> kept_grad = kept_loss.grad_logits.to_host();
+    int kept_row = 0;
+    for (int row = 0; row < rows; ++row) {
+      const size_t base = static_cast<size_t>(row) * classes;
+      if (mixed_labels[static_cast<size_t>(row)] == -100) {
+        for (int c = 0; c < classes; ++c) CHECK(mixed_grad[base + static_cast<size_t>(c)] == 0.f);
+        continue;
+      }
+      const size_t src = static_cast<size_t>(kept_row) * classes;
+      for (int c = 0; c < classes; ++c) {
+        check_close(static_cast<double>(kept_grad[src + static_cast<size_t>(c)]),
+                    static_cast<double>(mixed_grad[base + static_cast<size_t>(c)]), 1e-4, -1.0,
+                    "seq mixed grad", base + static_cast<size_t>(c));
+      }
+      ++kept_row;
+    }
+
+    nn::IndexTensor ignored(ctx, {n, t});
+    const std::vector<int64_t> all_ignored(static_cast<size_t>(rows), -100);
+    ignored.copy_from_host(all_ignored.data(), rows);
+    nn::LossResult zero_result = nn::sequence_cross_entropy(ctx, logits, ignored);
+    CHECK(zero_result.loss == 0.f);
+    for (float value : zero_result.grad_logits.to_host()) CHECK(value == 0.f);
+  }
+
   std::printf("grads ok\n");
   return 0;
 }
