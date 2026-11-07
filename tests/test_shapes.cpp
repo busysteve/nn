@@ -3,8 +3,11 @@
 #include "nn/builders.hpp"
 #include "nn/conv_resnet.hpp"
 #include "nn/error.hpp"
+#include "nn/index_tensor.hpp"
+#include "nn/init.hpp"
 #include "nn/layers/conv2d.hpp"
 #include "nn/layers/dropout.hpp"
+#include "nn/layers/embedding.hpp"
 #include "nn/layers/gelu.hpp"
 #include "nn/layers/last_step.hpp"
 #include "nn/layers/layer_norm.hpp"
@@ -18,6 +21,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -1362,6 +1366,98 @@ int test_shapes() {
 
   check_multi_head_attention(ctx, rng);
   check_transformer_block(ctx, rng);
+
+  {
+    expect_error([&] { nn::IndexTensor(ctx, {}); }, "index tensor rank out of range");
+    expect_error([&] { nn::IndexTensor(ctx, {1, 1, 1}); }, "index tensor rank out of range");
+    expect_error([&] { nn::IndexTensor(ctx, {0}); }, "index tensor dimension out of range");
+    expect_error([&] { nn::IndexTensor(ctx, {2, 0}); }, "index tensor dimension out of range");
+    expect_error([&] { nn::IndexTensor(ctx, {std::numeric_limits<int>::max(), 2}); },
+                 "index tensor numel out of range");
+
+    nn::IndexTensor ids(ctx, {2, 2});
+    CHECK(ids.data() != nullptr);
+    CHECK(ids.numel() == 4);
+    CHECK(ids.shape() == std::vector<int>({2, 2}));
+    CHECK(&ids.context() == &ctx);
+    const int64_t one = 0;
+    expect_error([&] { ids.copy_from_host(&one, 1); }, "index tensor host copy numel mismatch");
+
+    nn::Tensor sample(ctx, {4});
+    expect_error([&] { nn::normal_(sample, 0.f, 0.f, rng); }, "normal_ std");
+    expect_error([&] { nn::normal_(sample, 0.f, -0.1f, rng); }, "normal_ std");
+    expect_error([&] { nn::normal_(sample, std::numeric_limits<float>::infinity(), 0.02f, rng); },
+                 "normal_ mean");
+    std::mt19937 draw_rng(5);
+    std::mt19937 ref_rng(5);
+    nn::normal_(sample, 0.25f, 0.02f, draw_rng);
+    std::normal_distribution<float> dist(0.25f, 0.02f);
+    std::vector<float> drawn(4);
+    for (float& value : drawn) value = dist(ref_rng);
+    expect_close(sample.to_host(), drawn, "normal_");
+
+    expect_error([&] { nn::Embedding(ctx, 0, 2, rng); }, "Embedding size");
+    expect_error([&] { nn::Embedding(ctx, 2, -1, rng); }, "Embedding size");
+
+    nn::Embedding layer(ctx, 3, 2, rng);
+    nn::Tensor float_input(ctx, {2, 2});
+    expect_error([&] { layer.forward(float_input); }, "Embedding requires indices");
+
+    std::vector<nn::NamedParam> params = layer.parameters();
+    CHECK(params.size() == 1);
+    CHECK(params[0].name == "weight");
+    CHECK(params[0].value->shape() == std::vector<int>({3, 2}));
+    CHECK(params[0].grad->shape() == params[0].value->shape());
+    params[0].value->copy_from_host(std::vector<float>{1.f, 2.f, 3.f, 4.f, 5.f, 6.f});
+
+    const std::vector<int64_t> host_ids = {2, 0, 1, 0};
+    ids.copy_from_host(host_ids.data(), static_cast<int64_t>(host_ids.size()));
+    const nn::Tensor& output = layer.forward_indices(ids);
+    CHECK(output.shape() == std::vector<int>({2, 2, 2}));
+    expect_close(output.to_host(), {5.f, 6.f, 1.f, 2.f, 3.f, 4.f, 1.f, 2.f}, "embedding");
+
+    nn::IndexTensor bad(ctx, {2});
+    const std::vector<int64_t> oob = {0, 3};
+    bad.copy_from_host(oob.data(), static_cast<int64_t>(oob.size()));
+    expect_error([&] { layer.forward_indices(bad); }, "index out of range");
+    const std::vector<int64_t> neg = {-1, 1};
+    bad.copy_from_host(neg.data(), static_cast<int64_t>(neg.size()));
+    expect_error([&] { layer.forward_indices(bad); }, "index out of range");
+
+    // A rejected index must leave the ids captured by the last successful forward.
+    layer.zero_grad();
+    expect_close(params[0].grad->to_host(), std::vector<float>(6, 0.f), "embedding zero");
+    nn::Tensor grad(ctx, {2, 2, 2});
+    grad.copy_from_host(std::vector<float>{1.f, 10.f, 2.f, 20.f, 3.f, 30.f, 4.f, 40.f});
+    const std::vector<float> before = grad.to_host();
+    const nn::Tensor& back = layer.backward(grad);
+    CHECK(back.shape() == grad.shape());
+    expect_close(back.to_host(), std::vector<float>(static_cast<size_t>(grad.numel()), 0.f),
+                 "embedding backward return");
+    CHECK(std::memcmp(before.data(), grad.to_host().data(), before.size() * sizeof(float)) == 0);
+    expect_close(params[0].grad->to_host(), {6.f, 60.f, 3.f, 30.f, 1.f, 10.f}, "embedding grad");
+    layer.backward(grad);
+    expect_close(params[0].grad->to_host(), {12.f, 120.f, 6.f, 60.f, 2.f, 20.f},
+                 "embedding grad accum");
+
+    nn::Tensor bad_grad(ctx, {2, 2});
+    expect_error([&] { layer.backward(bad_grad); }, "Embedding backward shape");
+    nn::Embedding fresh(ctx, 2, 2, rng);
+    expect_error([&] { fresh.backward(bad_grad); }, "Embedding backward without forward");
+
+    nn::IndexTensor rows(ctx, {3});
+    const std::vector<int64_t> row_ids = {1, 2, 0};
+    rows.copy_from_host(row_ids.data(), static_cast<int64_t>(row_ids.size()));
+    const nn::Tensor& row_out = layer.forward_indices(rows);
+    CHECK(row_out.shape() == std::vector<int>({3, 2}));
+    expect_close(row_out.to_host(), {3.f, 4.f, 5.f, 6.f, 1.f, 2.f}, "embedding rows");
+
+    nn::Context other;
+    nn::IndexTensor foreign(other, {1});
+    const int64_t zero = 0;
+    foreign.copy_from_host(&zero, 1);
+    expect_error([&] { layer.forward_indices(foreign); }, "Embedding context");
+  }
 
   std::printf("shapes ok\n");
   return 0;

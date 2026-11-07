@@ -1,8 +1,10 @@
 #include "check.hpp"
 
+#include "nn/index_tensor.hpp"
 #include "nn/layers/batch_norm2d.hpp"
 #include "nn/layers/conv2d.hpp"
 #include "nn/layers/dropout.hpp"
+#include "nn/layers/embedding.hpp"
 #include "nn/layers/gelu.hpp"
 #include "nn/layers/last_step.hpp"
 #include "nn/layers/layer_norm.hpp"
@@ -17,6 +19,7 @@
 #include "nn/loss.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -95,6 +98,21 @@ std::vector<float> uniform(int64_t n, std::mt19937& rng, float low, float high) 
   std::vector<float> values(static_cast<size_t>(n));
   for (float& value : values) value = dist(rng);
   return values;
+}
+
+void check_embedding(nn::Embedding& layer, nn::IndexTensor& indices) {
+  layer.zero_grad();
+  const nn::Tensor& output = layer.forward_indices(indices);
+  const std::vector<float> output_host = output.to_host();
+  nn::Tensor grad_output(output.context(), output.shape());
+  grad_output.copy_from_host(output_host);
+  layer.backward(grad_output);
+  const std::vector<nn::NamedParam> params = layer.parameters();
+  CHECK(params.size() == 1);
+  CHECK(params[0].name == "weight");
+  const std::vector<float> analytic = params[0].grad->to_host();
+  const auto loss = [&]() { return squared_loss(layer.forward_indices(indices)); };
+  finite_difference(*params[0].value, analytic, loss, "weight");
 }
 
 void condition_bn(nn::Layer& layer) {
@@ -381,6 +399,25 @@ int test_gradients() {
     nn::Tensor input(ctx, {1, 3, 8});
     input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
     check_layer(layer, input);
+  }
+
+  std::printf("grad embedding\n");
+  {
+    nn::Embedding layer(ctx, 5, 3, rng);
+    nn::IndexTensor indices(ctx, {6});
+    // Index 1 is repeated so scatter-add has to accumulate.
+    const std::vector<int64_t> host = {1, 0, 1, 4, 0, 1};
+    indices.copy_from_host(host.data(), static_cast<int64_t>(host.size()));
+    check_embedding(layer, indices);
+  }
+
+  std::printf("grad embedding rank2\n");
+  {
+    nn::Embedding layer(ctx, 4, 2, rng);
+    nn::IndexTensor indices(ctx, {2, 3});
+    const std::vector<int64_t> host = {2, 1, 2, 0, 1, 3};
+    indices.copy_from_host(host.data(), static_cast<int64_t>(host.size()));
+    check_embedding(layer, indices);
   }
 
   std::printf("grad softmax\n");
