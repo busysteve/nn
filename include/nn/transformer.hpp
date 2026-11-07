@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nn/layers/embedding.hpp"
+#include "nn/layers/multi_head_attention.hpp"
 #include "nn/network.hpp"
 
 #include <memory>
@@ -25,6 +26,16 @@ class Transformer {
   const Tensor& forward(const Tensor& embeddings);
   const Tensor& backward(const Tensor& grad_logits);
 
+  // One KV cache per block. Not part of the checkpoint.
+  struct GenerateState {
+    std::vector<MultiHeadAttention::Cache> layer_caches;
+    int t = 0;  // next absolute position; tokens consumed so far
+  };
+
+  void reset_generate_state(GenerateState& st, int batch, int t_max);
+  const Tensor& decode_step(const IndexTensor& next_ids, GenerateState& st);
+  const Tensor& prefill(const IndexTensor& prompt_ids, GenerateState& st, int t_max);
+
   void zero_grad();
   void train();
   void eval();
@@ -47,7 +58,10 @@ class Transformer {
   Linear* lm_head_ptr_ = nullptr;
   std::optional<Network> network_;
   std::optional<Tensor> embedded_;
+  // Full-sequence embedded_ stays (N, T, D). A decode step must not resize it.
+  std::optional<Tensor> embedded_step_;
   std::optional<IndexTensor> pos_ids_;
+  std::optional<IndexTensor> pos_step_ids_;
   bool forwarded_ = false;
   bool used_embeddings_ = false;
 };

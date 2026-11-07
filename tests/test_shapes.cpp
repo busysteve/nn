@@ -629,6 +629,146 @@ void check_transformer_block(nn::Context& ctx, std::mt19937& rng) {
   }
 }
 
+std::vector<float> position_row(const std::vector<float>& logits, int batch, int time, int index,
+                                int vocab) {
+  const size_t offset =
+      (static_cast<size_t>(batch) * static_cast<size_t>(time) + static_cast<size_t>(index)) *
+      static_cast<size_t>(vocab);
+  return std::vector<float>(logits.begin() + static_cast<std::ptrdiff_t>(offset),
+                            logits.begin() + static_cast<std::ptrdiff_t>(offset + static_cast<size_t>(vocab)));
+}
+
+void check_cached_decode(nn::Context& ctx, std::mt19937& rng) {
+  {
+    nn::MultiHeadAttention layer(ctx, 8, 2, true, false, false, rng);
+    nn::MultiHeadAttention::Cache cache{nn::Tensor(ctx, {1, 1, 1, 1}), nn::Tensor(ctx, {1, 1, 1, 1}), 0};
+    expect_invalid([&] { layer.reset_cache(cache, 0, 4); }, "batch");
+    expect_invalid([&] { layer.reset_cache(cache, 1, 0); }, "t_max");
+    layer.reset_cache(cache, 1, 3);
+    CHECK(cache.k.shape() == std::vector<int>({1, 2, 3, 4}));
+    CHECK(cache.v.shape() == cache.k.shape());
+    CHECK(cache.t == 0);
+
+    nn::Tensor sequence(ctx, {1, 3, 8});
+    std::mt19937 data_rng(3);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> host(static_cast<size_t>(sequence.numel()));
+    for (float& value : host) value = dist(data_rng);
+    sequence.copy_from_host(host);
+    const std::vector<float> full = layer.forward(sequence).to_host();
+    for (int t = 0; t < 3; ++t) {
+      nn::Tensor step(ctx, {1, 1, 8});
+      step.copy_from_host(std::vector<float>(host.begin() + t * 8, host.begin() + (t + 1) * 8));
+      const std::vector<float> got = layer.forward_cached(step, cache).to_host();
+      expect_close(got, position_row(full, 0, 3, t, 8), "mha-cache");
+      CHECK(cache.t == t + 1);
+    }
+    nn::Tensor extra(ctx, {1, 1, 8});
+    extra.fill(0.1f);
+    expect_invalid([&] { layer.forward_cached(extra, cache); }, "cache");
+    nn::Tensor bad_time(ctx, {1, 2, 8});
+    expect_invalid([&] { layer.forward_cached(bad_time, cache); }, "x_t");
+    nn::Tensor grad(ctx, {1, 1, 8});
+    grad.fill(1.f);
+    expect_invalid([&] { layer.backward(grad); }, "forward_cached");
+    const nn::Tensor& again = layer.forward(sequence);
+    nn::Tensor grad_full(ctx, again.shape());
+    grad_full.fill(1.f);
+    CHECK(layer.backward(grad_full).shape() == sequence.shape());
+  }
+
+  nn::TransformerConfig config;
+  config.vocab_size = 10;
+  config.d_model = 8;
+  config.num_heads = 2;
+  config.num_layers = 2;
+  config.d_ff = 16;
+  config.max_seq_len = 8;
+  config.dropout = 0.f;
+  config.bias = false;
+  config.activation = nn::TransformerActivation::SwiGLU;
+  config.positional = nn::PositionalEncoding::LearnedAbsolute;
+  nn::Transformer model(ctx, config, 7);
+  model.eval();
+
+  std::mt19937 prompt_rng(11);
+  std::uniform_int_distribution<int64_t> pick(0, config.vocab_size - 1);
+  std::vector<int64_t> prompt(3);
+  for (int64_t& id : prompt) id = pick(prompt_rng);
+
+  for (int length = 1; length <= 3; ++length) {
+    nn::IndexTensor tokens(ctx, {1, length});
+    tokens.copy_from_host(prompt.data(), length);
+    const std::vector<float> full = model.forward(tokens).to_host();
+    const std::vector<float> want = position_row(full, 0, length, length - 1, config.vocab_size);
+
+    nn::Transformer::GenerateState prefilled;
+    const nn::Tensor& prefill_logits = model.prefill(tokens, prefilled, config.max_seq_len);
+    CHECK(prefill_logits.shape() == std::vector<int>({1, 1, config.vocab_size}));
+    expect_close(prefill_logits.to_host(), want, "prefill-last");
+    CHECK(prefilled.t == length);
+    CHECK(prefilled.layer_caches.size() == static_cast<size_t>(config.num_layers));
+    for (const nn::MultiHeadAttention::Cache& cache : prefilled.layer_caches) CHECK(cache.t == length);
+
+    nn::Transformer::GenerateState stepped;
+    model.reset_generate_state(stepped, 1, config.max_seq_len);
+    CHECK(stepped.layer_caches[0].k.shape() == std::vector<int>({1, 2, config.max_seq_len, 4}));
+    const nn::Tensor* logits = nullptr;
+    for (int t = 0; t < length; ++t) {
+      nn::IndexTensor step(ctx, {1, 1});
+      step.copy_from_host(&prompt[static_cast<size_t>(t)], 1);
+      logits = &model.decode_step(step, stepped);
+    }
+    CHECK(logits->shape() == std::vector<int>({1, 1, config.vocab_size}));
+    expect_close(logits->to_host(), want, "decode-last");
+    CHECK(stepped.t == length);
+    for (const nn::MultiHeadAttention::Cache& cache : stepped.layer_caches) CHECK(cache.t == length);
+
+    const std::vector<float> again = model.forward(tokens).to_host();
+    expect_close(position_row(again, 0, length, length - 1, config.vocab_size), want, "forward-stable");
+  }
+
+  {
+    nn::IndexTensor batch_tokens(ctx, {2, 2});
+    const std::vector<int64_t> ids = {1, 4, 2, 0};
+    batch_tokens.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
+    const std::vector<float> full = model.forward(batch_tokens).to_host();
+    nn::Transformer::GenerateState st;
+    const std::vector<float> cached = model.prefill(batch_tokens, st, config.max_seq_len).to_host();
+    CHECK(st.t == 2);
+    for (int batch = 0; batch < 2; ++batch) {
+      expect_close(position_row(cached, batch, 1, 0, config.vocab_size),
+                   position_row(full, batch, 2, 1, config.vocab_size), "prefill-batch");
+    }
+  }
+
+  nn::IndexTensor one(ctx, {1, 1});
+  const int64_t id = prompt[0];
+  one.copy_from_host(&id, 1);
+  model.train();
+  nn::Transformer::GenerateState st;
+  model.reset_generate_state(st, 1, 2);
+  expect_invalid([&] { model.decode_step(one, st); }, "decode_step");
+
+  model.eval();
+  model.reset_generate_state(st, 1, 2);
+  model.decode_step(one, st);
+  model.decode_step(one, st);
+  CHECK(st.t == 2);
+  expect_invalid([&] { model.decode_step(one, st); }, "cache");
+
+  model.reset_generate_state(st, 1, config.max_seq_len);
+  st.t = config.max_seq_len;
+  expect_invalid([&] { model.decode_step(one, st); }, "max_seq_len");
+
+  nn::IndexTensor wide(ctx, {1, 2});
+  expect_invalid([&] { model.decode_step(wide, st); }, "next_ids");
+  nn::IndexTensor too_long(ctx, {1, 3});
+  const std::vector<int64_t> ids = {0, 1, 2};
+  too_long.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
+  expect_invalid([&] { model.prefill(too_long, st, 2); }, "t_max");
+}
+
 }  // namespace
 
 int test_shapes() {
@@ -1481,6 +1621,7 @@ int test_shapes() {
 
   check_multi_head_attention(ctx, rng);
   check_transformer_block(ctx, rng);
+  check_cached_decode(ctx, rng);
 
   {
     expect_error([&] { nn::IndexTensor(ctx, {}); }, "index tensor rank out of range");

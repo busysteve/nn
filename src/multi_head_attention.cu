@@ -78,6 +78,15 @@ __global__ void causal_mask_kernel(float* scores, int time, int64_t n) {
   if (col > row) scores[i] = kMask;
 }
 
+// src is (N, H, 1, Dh). dst is (N, H, T_max, Dh). One token, so the copy is Dh-wide.
+__global__ void write_kv_kernel(float* dst, const float* src, int t, int t_max, int dh, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int d = static_cast<int>(i % dh);
+  const int64_t head = i / dh;
+  dst[(head * static_cast<int64_t>(t_max) + t) * dh + d] = src[i];
+}
+
 __global__ void softmax_rows_kernel(float* out, const float* in, int cols) {
   __shared__ float buffer[kThreads];
   const int row = static_cast<int>(blockIdx.x);
@@ -137,6 +146,12 @@ void launch_merge_heads(cudaStream_t stream, float* dst, const float* src, int t
                         int dh, int64_t n) {
   merge_heads_kernel<<<blocks_for(n), kThreads, 0, stream>>>(dst, src, time, heads, dh, n);
   check_cuda(cudaGetLastError(), "mha_merge_heads");
+}
+
+void launch_write_kv(cudaStream_t stream, float* dst, const float* src, int t, int t_max, int dh,
+                     int64_t n) {
+  write_kv_kernel<<<blocks_for(n), kThreads, 0, stream>>>(dst, src, t, t_max, dh, n);
+  check_cuda(cudaGetLastError(), "mha_write_kv");
 }
 
 // Row-major (T, Dh) occupies the same buffer as column-major (Dh, T).
@@ -228,6 +243,7 @@ void MultiHeadAttention::zero_grad() {
 const Tensor& MultiHeadAttention::forward(const Tensor& input) {
   const std::vector<int>& shape = input.shape();
   if (shape.size() != 3 || shape[2] != d_model_) throw Error("MultiHeadAttention input shape");
+  cached_forward_ = false;
   const int n = shape[0];
   const int time = shape[1];
   const int heads = num_heads_;
@@ -269,7 +285,91 @@ const Tensor& MultiHeadAttention::forward(const Tensor& input) {
   return *output_;
 }
 
+void MultiHeadAttention::reset_cache(Cache& cache, int batch, int t_max) const {
+  if (batch < 1) throw std::invalid_argument("batch");
+  if (t_max < 1) throw std::invalid_argument("t_max");
+  cache.k = Tensor(*ctx_, {batch, num_heads_, t_max, head_dim_});
+  cache.v = Tensor(*ctx_, {batch, num_heads_, t_max, head_dim_});
+  cache.k.zero();
+  cache.v.zero();
+  cache.t = 0;
+}
+
+const Tensor& MultiHeadAttention::forward_cached(const Tensor& x_t, Cache& cache) {
+  if (&x_t.context() != ctx_ || x_t.rank() != 3 || x_t.shape()[1] != 1 || x_t.shape()[2] != d_model_) {
+    throw std::invalid_argument("x_t");
+  }
+  const int n = x_t.shape()[0];
+  const int heads = num_heads_;
+  const int dh = head_dim_;
+  const std::vector<int>& k_shape = cache.k.shape();
+  if (&cache.k.context() != ctx_ || &cache.v.context() != ctx_ || cache.k.rank() != 4 ||
+      cache.v.shape() != k_shape || k_shape[0] != n || k_shape[1] != heads || k_shape[3] != dh ||
+      cache.t < 0 || cache.t >= k_shape[2]) {
+    throw std::invalid_argument("cache");
+  }
+  // Full-sequence backward must not run on this one-token scratch.
+  cached_forward_ = true;
+
+  const int t = cache.t;
+  const int t_max = k_shape[2];
+  const int tk = t + 1;
+  constexpr int tq = 1;
+  const int batch = n * heads;
+  const std::vector<int> q_shape = {n, heads, tq, dh};
+  const std::vector<int> score_shape = {n, heads, tq, tk};
+  const std::vector<int> flat_shape = x_t.shape();
+
+  ensure_tensor(q_heads_, *ctx_, q_shape);
+  ensure_tensor(k_heads_, *ctx_, q_shape);
+  ensure_tensor(v_heads_, *ctx_, q_shape);
+  ensure_tensor(scores_, *ctx_, score_shape);
+  ensure_tensor(attn_, *ctx_, score_shape);
+  ensure_tensor(context_, *ctx_, q_shape);
+  ensure_tensor(merged_, *ctx_, flat_shape);
+  ensure_tensor(output_, *ctx_, flat_shape);
+
+  cudaStream_t stream = stream_of(*ctx_);
+  cublasHandle_t handle = cublas_of(*ctx_);
+  const int64_t hidden = x_t.numel();
+  launch_split_heads(stream, q_heads_->data(), q_->forward(x_t).data(), tq, heads, dh, hidden);
+  launch_split_heads(stream, k_heads_->data(), k_->forward(x_t).data(), tq, heads, dh, hidden);
+  launch_split_heads(stream, v_heads_->data(), v_->forward(x_t).data(), tq, heads, dh, hidden);
+  const int64_t kv_n = static_cast<int64_t>(batch) * dh;
+  launch_write_kv(stream, cache.k.data(), k_heads_->data(), t, t_max, dh, kv_n);
+  launch_write_kv(stream, cache.v.data(), v_heads_->data(), t, t_max, dh, kv_n);
+
+  // S = scale * Q K^T over the written prefix only. K's stride stays T_max so the tail is unread.
+  // Row-major (Tq, Tk) is column-major (Tk, Tq): S_cm = scale * K_cm^T Q_cm.
+  const float scale = 1.f / std::sqrt(static_cast<float>(dh));
+  const float beta = 0.f;
+  const long long stride_k = static_cast<long long>(t_max) * dh;
+  const long long stride_q = static_cast<long long>(tq) * dh;
+  const long long stride_s = static_cast<long long>(tq) * tk;
+  check_cublas(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, tk, tq, dh, &scale,
+                                          cache.k.data(), CUDA_R_32F, dh, stride_k, q_heads_->data(),
+                                          CUDA_R_32F, dh, stride_q, &beta, scores_->data(), CUDA_R_32F,
+                                          tk, stride_s, batch, CUBLAS_COMPUTE_32F_PEDANTIC,
+                                          CUBLAS_GEMM_DEFAULT),
+               "cublasGemmStridedBatchedEx");
+  softmax_rows_kernel<<<batch, kThreads, 0, stream>>>(attn_->data(), scores_->data(), tk);
+  check_cuda(cudaGetLastError(), "mha_softmax");
+  // context = attn V. context_cm = V_cm attn_cm, same product as dQ = dS K with scale 1.
+  const float one = 1.f;
+  check_cublas(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, dh, tq, tk, &one,
+                                          cache.v.data(), CUDA_R_32F, dh, stride_k, attn_->data(),
+                                          CUDA_R_32F, tk, stride_s, &beta, context_->data(),
+                                          CUDA_R_32F, dh, stride_q, batch, CUBLAS_COMPUTE_32F_PEDANTIC,
+                                          CUBLAS_GEMM_DEFAULT),
+               "cublasGemmStridedBatchedEx");
+  launch_merge_heads(stream, merged_->data(), context_->data(), tq, heads, dh, hidden);
+  output_->copy_from(out_->forward(*merged_));
+  cache.t = tk;
+  return *output_;
+}
+
 const Tensor& MultiHeadAttention::backward(const Tensor& grad_output) {
+  if (cached_forward_) throw std::invalid_argument("forward_cached");
   if (!output_ || !attn_ || !q_heads_ || !k_heads_ || !v_heads_ ||
       grad_output.shape() != output_->shape()) {
     throw Error("MultiHeadAttention backward shape");

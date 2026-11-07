@@ -457,7 +457,7 @@ MultiHeadAttention(Context& ctx, int d_model, int num_heads, bool causal, bool u
                    bool use_rope, std::mt19937& rng);
 ```
 
-`d_model` and `num_heads` are at least 1, and `d_model` must be divisible by `num_heads` (`MultiHeadAttention size`). `use_rope == true` throws `std::invalid_argument` with message `use_rope`. Rotary positions are not implemented. There is no attention dropout and no key/value cache. `set_training` does not change the result.
+`d_model` and `num_heads` are at least 1, and `d_model` must be divisible by `num_heads` (`MultiHeadAttention size`). `use_rope == true` throws `std::invalid_argument` with message `use_rope`. Rotary positions are not implemented. There is no attention dropout. `set_training` does not change the result.
 
 The layer owns four `Linear` children, each `d_model` to `d_model`, constructed in order `q`, `k`, `v`, `out`. Each child uses `use_bias` and draws its weight from `rng`. Bias, when present, starts at 0 and consumes no random numbers. Parameter names are the child prefix plus the linear name:
 
@@ -469,6 +469,19 @@ The layer owns four `Linear` children, each `d_model` to `d_model`, constructed 
 `forward` takes `(N, T, d_model)` and returns the same shape. `Dh = d_model / num_heads`. Projections are the child linears. Attention scores are `Q K^T / sqrt(Dh)` with shape `(N, num_heads, T, T)`. When `causal` is true, entries with key index `j > i` are set to `-1e9` before the softmax over the last dimension. The attention output is projected by `out`. A rank other than 3, or a last dimension other than `d_model`, throws `MultiHeadAttention input shape`.
 
 `backward` returns the input shape and adds into each child's `grad_weight` and, when bias is on, `grad_bias`. A missing forward or a mismatched gradient throws `MultiHeadAttention backward shape`. `zero_grad` clears every child.
+
+```cpp
+struct Cache {
+  Tensor k;  // (N, H, T_max, Dh)
+  Tensor v;  // (N, H, T_max, Dh)
+  int t = 0;  // next write index
+};
+
+void reset_cache(Cache& cache, int batch, int t_max) const;
+const Tensor& forward_cached(const Tensor& x_t, Cache& cache);
+```
+
+`reset_cache` allocates `k` and `v` on this context, zeros them, and sets `t = 0`. `batch < 1` throws `batch`. `t_max < 1` throws `t_max`. Replacing a cache is fine. `forward_cached` is the generation step. `x_t` must be `(N, 1, d_model)` on this context (`x_t`). `N` must match the cache batch and `cache.t` must be less than `T_max` (`cache`). The step projects that token, writes K and V at `cache.t`, and attends over keys `0 .. cache.t` inclusive. Scores are `(N, num_heads, 1, cache.t + 1)`, scaled by `1/sqrt(Dh)`, then the same max-subtract softmax as `forward`. The unwritten tail is not read, and there is no `(T, T)` mask. The return is `(N, 1, d_model)`. `cache.t` then increases by 1. `backward` after `forward_cached` throws `forward_cached` instead of the full-sequence backward. A later `forward` clears that state.
 
 ### TransformerBlock
 
@@ -499,6 +512,15 @@ y = h + drop2(ffn(ln2(h)))
 ```
 
 `d_ff` is the width after the gate. GELU is `Linear(d_model → d_ff)`, `GELU`, `Linear(d_ff → d_model)`. SwiGLU is `Linear(d_model → 2*d_ff)`, `SwiGLU`, `Linear(d_ff → d_model)`. Both linears use `bias`. `attn()` is the owned attention layer. `set_training` reaches both dropouts. Child parameter prefixes are `ln1.`, `attn.`, `drop1.`, `ln2.`, `fc1.`, `fc2.`. Dropout and the activation have no parameters. `forward` takes `(N, T, d_model)` and returns the same shape. A rank other than 3, or a last dimension other than `d_model`, throws `TransformerBlock input shape`. A missing forward or a mismatched gradient throws `TransformerBlock backward shape`.
+
+`forward_cached(x_t, cache)` is the same pre-norm residual, with `mha->forward_cached` instead of `mha->forward`:
+
+```
+h = x_t + drop1(mha->forward_cached(ln1(x_t), cache))
+y = h + drop2(ffn(ln2(h)))
+```
+
+`x_t` and `y` are `(N, 1, d_model)`. Dropout follows `set_training`. Generation calls `eval()`, so dropout is the identity.
 
 ### Flatten
 
@@ -778,6 +800,15 @@ class Transformer {
   const Tensor& forward(const Tensor& embeddings);   // (N, T, D) -> logits, skips both embeddings
   const Tensor& backward(const Tensor& grad_logits);
 
+  struct GenerateState {
+    std::vector<MultiHeadAttention::Cache> layer_caches;
+    int t = 0;  // next absolute position; tokens consumed so far
+  };
+
+  void reset_generate_state(GenerateState& st, int batch, int t_max);
+  const Tensor& decode_step(const IndexTensor& next_ids, GenerateState& st);  // (N, 1) -> (N, 1, V)
+  const Tensor& prefill(const IndexTensor& prompt_ids, GenerateState& st, int t_max);
+
   void zero_grad();
   void train();
   void eval();
@@ -797,7 +828,9 @@ struct Transformer::Loaded {
 };
 ```
 
-`forward(const IndexTensor&)` reads token ids of shape `(N, T)` and returns logits `(N, T, vocab_size)`. Rank other than 2 throws `tokens`. `T > max_seq_len` throws `max_seq_len` before either embedding runs. Learned-absolute positions are the column index `0 .. T-1` on every row, added to the token embedding. `forward(const Tensor&)` reads a float tensor `(N, T, d_model)` and skips both embeddings. A rank or width mismatch throws `embeddings`. Backward after that hook does not update embedding gradients.
+`forward(const IndexTensor&)` reads token ids of shape `(N, T)` and returns logits `(N, T, vocab_size)`. Rank other than 2 throws `tokens`. `T > max_seq_len` throws `max_seq_len` before either embedding runs. Learned-absolute positions are the column index `0 .. T-1` on every row, added to the token embedding. `forward(const Tensor&)` reads a float tensor `(N, T, d_model)` and skips both embeddings. A rank or width mismatch throws `embeddings`. Backward after that hook does not update embedding gradients. Full `forward` does not fill the KV cache.
+
+`reset_generate_state` builds one cache per block (`attn().reset_cache`) and sets `st.t = 0`. `decode_step` requires `eval()`; `training()` throws `decode_step`. `next_ids` is `(N, 1)` (`next_ids`) and `N` must match the cache batch (`cache`). Learned-absolute positions are the index `st.t` on every row. `st.t >= max_seq_len` throws `max_seq_len` before that upload. Each block writes its cache at that same index, then `st.t` increases by 1. The return is the `lm_head` tensor `(N, 1, vocab_size)`. `prefill` resets, then runs `decode_step` once per prompt column, and returns the last step's logits. `prompt_ids` is `(N, T_prompt)` with `1 <= T_prompt <= t_max` (`prompt_ids`, `t_max`). `GenerateState` is not written by `save`.
 
 `parameters()` is `tok_emb.weight`, then `pos_emb.weight`, then `network().parameters()`. `network().parameters()` does not include `tok_emb` or `pos_emb`.
 

@@ -29,6 +29,7 @@ class TransformerBlock : public Layer {
   TransformerBlock(Context& ctx, const TransformerBlockSpec& spec, std::mt19937& rng);
   ~TransformerBlock() override;
   const Tensor& forward(const Tensor& input) override;  // (N,T,D)
+  const Tensor& forward_cached(const Tensor& x_t, MultiHeadAttention::Cache& cache);
   const Tensor& backward(const Tensor& grad_output) override;
   std::vector<NamedParam> parameters() const override;
   void zero_grad() override;

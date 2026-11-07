@@ -118,6 +118,21 @@ const Tensor& TransformerBlock::forward(const Tensor& input) {
   return *output_;
 }
 
+const Tensor& TransformerBlock::forward_cached(const Tensor& input, MultiHeadAttention::Cache& cache) {
+  const std::vector<int>& shape = input.shape();
+  if (shape.size() != 3 || shape[2] != d_model_) throw Error("TransformerBlock input shape");
+
+  const Tensor& dropped_attn = drop1_->forward(mha_->forward_cached(ln1_->forward(input), cache));
+  ensure_tensor(hidden_, *ctx_, shape);
+  launch_add2(stream_of(*ctx_), hidden_->data(), input.data(), dropped_attn.data(), input.numel());
+
+  const Tensor& dropped_ff =
+      drop2_->forward(fc2_->forward(act_->forward(fc1_->forward(ln2_->forward(*hidden_)))));
+  ensure_tensor(output_, *ctx_, shape);
+  launch_add2(stream_of(*ctx_), output_->data(), hidden_->data(), dropped_ff.data(), input.numel());
+  return *output_;
+}
+
 const Tensor& TransformerBlock::backward(const Tensor& grad_output) {
   if (!hidden_ || !output_ || grad_output.shape() != output_->shape()) {
     throw Error("TransformerBlock backward shape");

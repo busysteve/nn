@@ -1,5 +1,6 @@
 #include "nn/transformer.hpp"
 
+#include "check.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
 #include "kernels.hpp"
@@ -90,6 +91,85 @@ const Tensor& Transformer::forward(const IndexTensor& tokens) {
   forwarded_ = true;
   used_embeddings_ = true;
   return logits;
+}
+
+void Transformer::reset_generate_state(GenerateState& st, int batch, int t_max) {
+  // Cache owns Tensors, so it is not default-constructible and vector::resize cannot build it.
+  std::vector<MultiHeadAttention::Cache> caches;
+  caches.reserve(block_ptrs_.size());
+  for (TransformerBlock* block : block_ptrs_) {
+    MultiHeadAttention::Cache cache{Tensor(*ctx_, {1, 1, 1, 1}), Tensor(*ctx_, {1, 1, 1, 1}), 0};
+    block->attn().reset_cache(cache, batch, t_max);
+    caches.push_back(std::move(cache));
+  }
+  st.layer_caches = std::move(caches);
+  st.t = 0;
+}
+
+const Tensor& Transformer::decode_step(const IndexTensor& next_ids, GenerateState& st) {
+  if (training()) throw std::invalid_argument("decode_step");
+  if (&next_ids.context() != ctx_ || next_ids.shape().size() != 2 || next_ids.shape()[1] != 1) {
+    throw std::invalid_argument("next_ids");
+  }
+  const int n = next_ids.shape()[0];
+  if (st.layer_caches.size() != block_ptrs_.size()) throw std::invalid_argument("cache");
+  for (const MultiHeadAttention::Cache& cache : st.layer_caches) {
+    if (cache.k.rank() != 4 || cache.k.shape()[0] != n) throw std::invalid_argument("cache");
+  }
+
+  const Tensor& tok = tok_emb_->forward_indices(next_ids);
+  const Tensor* x = &tok;
+  if (pos_emb_) {
+    if (st.t >= transformer_config(*network_).max_seq_len) throw std::invalid_argument("max_seq_len");
+    if (!pos_step_ids_ || pos_step_ids_->shape()[0] != n || pos_step_ids_->shape()[1] != 1) {
+      pos_step_ids_.emplace(*ctx_, std::vector<int>{n, 1});
+    }
+    std::vector<int64_t> host(static_cast<size_t>(n), static_cast<int64_t>(st.t));
+    pos_step_ids_->copy_from_host(host.data(), pos_step_ids_->numel());
+    // copy_from_host is async; the local buffer has to stay alive until it finishes.
+    ctx_->synchronize();
+    const Tensor& pos = pos_emb_->forward_indices(*pos_step_ids_);
+    ensure_tensor(embedded_step_, *ctx_, tok.shape());
+    launch_add2(stream_of(*ctx_), embedded_step_->data(), tok.data(), pos.data(), tok.numel());
+    x = &*embedded_step_;
+  }
+
+  for (size_t i = 0; i < block_ptrs_.size(); ++i) {
+    x = &block_ptrs_[i]->forward_cached(*x, st.layer_caches[i]);
+  }
+  const Tensor& y = final_ln_ptr_->forward(*x);
+  const Tensor& logits = lm_head_ptr_->forward(y);
+  st.t += 1;
+  return logits;
+}
+
+const Tensor& Transformer::prefill(const IndexTensor& prompt_ids, GenerateState& st, int t_max) {
+  if (prompt_ids.shape().size() != 2) throw std::invalid_argument("prompt_ids");
+  const int n = prompt_ids.shape()[0];
+  const int t_prompt = prompt_ids.shape()[1];
+  if (t_prompt > t_max) throw std::invalid_argument("t_max");
+  reset_generate_state(st, n, t_max);
+
+  prompt_ids.context().synchronize();
+  std::vector<int64_t> host(static_cast<size_t>(prompt_ids.numel()));
+  check_cuda(cudaMemcpy(host.data(), prompt_ids.data(), host.size() * sizeof(int64_t),
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy");
+
+  IndexTensor column(*ctx_, {n, 1});
+  const Tensor* logits = nullptr;
+  for (int t = 0; t < t_prompt; ++t) {
+    std::vector<int64_t> ids(static_cast<size_t>(n));
+    for (int row = 0; row < n; ++row) {
+      ids[static_cast<size_t>(row)] =
+          host[static_cast<size_t>(row) * static_cast<size_t>(t_prompt) + static_cast<size_t>(t)];
+    }
+    column.copy_from_host(ids.data(), column.numel());
+    // copy_from_host is async; the local buffer has to stay alive until it finishes.
+    ctx_->synchronize();
+    logits = &decode_step(column, st);
+  }
+  return *logits;
 }
 
 const Tensor& Transformer::forward(const Tensor& embeddings) {

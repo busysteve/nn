@@ -11,9 +11,17 @@ namespace nn {
 
 class MultiHeadAttention : public Layer {
  public:
+  struct Cache {
+    Tensor k;  // (N, H, T_max, Dh)
+    Tensor v;  // (N, H, T_max, Dh)
+    int t = 0;  // next write index
+  };
+
   MultiHeadAttention(Context& ctx, int d_model, int num_heads, bool causal, bool use_bias,
                      bool use_rope, std::mt19937& rng);
   const Tensor& forward(const Tensor& input) override;  // (N,T,D)
+  const Tensor& forward_cached(const Tensor& x_t, Cache& cache);
+  void reset_cache(Cache& cache, int batch, int t_max) const;
   const Tensor& backward(const Tensor& grad_output) override;
   std::vector<NamedParam> parameters() const override;
   void zero_grad() override;
@@ -45,6 +53,7 @@ class MultiHeadAttention : public Layer {
   std::optional<Tensor> merged_grad_;
   std::optional<Tensor> grad_pair_;
   std::optional<Tensor> grad_input_;
+  bool cached_forward_ = false;
 };
 
 }  // namespace nn
