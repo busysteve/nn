@@ -133,8 +133,11 @@ void validate(const TransformerConfig& config) {
       config.activation != TransformerActivation::SwiGLU) {
     bad("activation");
   }
-  if (config.positional == PositionalEncoding::Rope) bad("use_rope");
-  if (config.positional != PositionalEncoding::LearnedAbsolute) bad("positional");
+  if (config.positional == PositionalEncoding::Rope) {
+    if ((config.d_model / config.num_heads) % 2 != 0) bad("use_rope");
+  } else if (config.positional != PositionalEncoding::LearnedAbsolute) {
+    bad("positional");
+  }
   if (config.activation == TransformerActivation::SwiGLU && config.d_ff > INT_MAX / 2) bad("d_ff");
 }
 

@@ -15,6 +15,7 @@
 #include "nn/layers/multi_head_attention.hpp"
 #include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
+#include "nn/layers/rms_norm.hpp"
 #include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
 #include "nn/layers/transformer_block.hpp"
@@ -304,16 +305,42 @@ std::vector<float> linear_ref(const std::vector<float>& x, int rows, int in_f, i
   return y;
 }
 
+void rope_adjacent(std::vector<float>& values, int n, int time, int heads, int dh) {
+  for (int batch = 0; batch < n; ++batch) {
+    for (int t = 0; t < time; ++t) {
+      for (int h = 0; h < heads; ++h) {
+        for (int pair = 0; pair < dh / 2; ++pair) {
+          const double theta = static_cast<double>(t) *
+                               std::pow(10000.0, -2.0 * static_cast<double>(pair) / static_cast<double>(dh));
+          const double c = std::cos(theta);
+          const double s = std::sin(theta);
+          const size_t i0 =
+              static_cast<size_t>((((batch * time + t) * heads + h) * dh) + pair * 2);
+          const double x0 = values[i0];
+          const double x1 = values[i0 + 1];
+          values[i0] = static_cast<float>(x0 * c - x1 * s);
+          values[i0 + 1] = static_cast<float>(x0 * s + x1 * c);
+        }
+      }
+    }
+  }
+}
+
 std::vector<float> mha_ref(const std::vector<float>& x, int n, int time, int d_model, int heads,
                            bool causal, const std::vector<float>& wq, const std::vector<float>* bq,
                            const std::vector<float>& wk, const std::vector<float>* bk,
                            const std::vector<float>& wv, const std::vector<float>* bv,
-                           const std::vector<float>& wo, const std::vector<float>* bo) {
+                           const std::vector<float>& wo, const std::vector<float>* bo,
+                           bool rope = false) {
   const int dh = d_model / heads;
   const int rows = n * time;
-  const std::vector<float> q = linear_ref(x, rows, d_model, d_model, wq, bq);
-  const std::vector<float> k = linear_ref(x, rows, d_model, d_model, wk, bk);
+  std::vector<float> q = linear_ref(x, rows, d_model, d_model, wq, bq);
+  std::vector<float> k = linear_ref(x, rows, d_model, d_model, wk, bk);
   const std::vector<float> v = linear_ref(x, rows, d_model, d_model, wv, bv);
+  if (rope) {
+    rope_adjacent(q, n, time, heads, dh);
+    rope_adjacent(k, n, time, heads, dh);
+  }
   const double scale = 1.0 / std::sqrt(static_cast<double>(dh));
   const double mask = static_cast<double>(-1.0e9f);
   std::vector<float> mixed(static_cast<size_t>(rows) * static_cast<size_t>(d_model), 0.f);
@@ -388,7 +415,7 @@ void set_param(nn::Layer& layer, const std::string& name, const std::vector<floa
 }
 
 void expect_mha_matches(nn::MultiHeadAttention& layer, const nn::Tensor& input, int n, int time,
-                        int d_model, int heads, bool causal, const char* name) {
+                        int d_model, int heads, bool causal, const char* name, bool rope = false) {
   std::vector<float> bq;
   std::vector<float> bk;
   std::vector<float> bv;
@@ -397,7 +424,7 @@ void expect_mha_matches(nn::MultiHeadAttention& layer, const nn::Tensor& input, 
       input.to_host(), n, time, d_model, heads, causal, host_param(layer, "q.weight"),
       bias_of(layer, "q.bias", bq), host_param(layer, "k.weight"), bias_of(layer, "k.bias", bk),
       host_param(layer, "v.weight"), bias_of(layer, "v.bias", bv), host_param(layer, "out.weight"),
-      bias_of(layer, "out.bias", bo));
+      bias_of(layer, "out.bias", bo), rope);
   const nn::Tensor& output = layer.forward(input);
   CHECK(output.shape() == std::vector<int>({n, time, d_model}));
   expect_close(output.to_host(), want, name);
@@ -410,7 +437,7 @@ std::vector<float> eye(int d) {
 }
 
 void check_multi_head_attention(nn::Context& ctx, std::mt19937& rng) {
-  expect_invalid([&] { nn::MultiHeadAttention(ctx, 4, 2, true, false, true, rng); }, "use_rope");
+  expect_invalid([&] { nn::MultiHeadAttention(ctx, 3, 1, true, false, true, rng); }, "use_rope");
   expect_error([&] { nn::MultiHeadAttention(ctx, 4, 3, true, false, false, rng); },
                "MultiHeadAttention size");
   expect_error([&] { nn::MultiHeadAttention(ctx, 4, 0, true, false, false, rng); },
@@ -523,6 +550,14 @@ void check_multi_head_attention(nn::Context& ctx, std::mt19937& rng) {
     expect_mha_matches(layer, input, 1, 1, 2, 2, true, "mha-t1");
     CHECK(layer.forward(input).shape() == std::vector<int>({1, 1, 2}));
   }
+
+  {
+    nn::MultiHeadAttention layer(ctx, 4, 2, true, false, true, rng);
+    nn::Tensor input(ctx, {1, 3, 4});
+    input.copy_from_host(std::vector<float>{0.2f, -0.4f, 0.1f, 0.3f, -0.2f, 0.5f, -0.1f, 0.4f,
+                                            0.3f, -0.3f, 0.2f, 0.1f});
+    expect_mha_matches(layer, input, 1, 3, 4, 2, true, "mha-rope", true);
+  }
 }
 
 void expect_named(const nn::Layer& layer,
@@ -593,6 +628,8 @@ void check_transformer_block(nn::Context& ctx, std::mt19937& rng) {
     spec.activation = static_cast<nn::TransformerActivation>(0);
     expect_error([&] { nn::TransformerBlock(ctx, spec, rng); }, "TransformerBlock activation");
     spec = tiny_block_spec();
+    spec.d_model = 6;
+    spec.num_heads = 2;
     spec.use_rope = true;
     expect_invalid([&] { nn::TransformerBlock(ctx, spec, rng); }, "use_rope");
   }
@@ -683,6 +720,25 @@ void check_transformer_block(nn::Context& ctx, std::mt19937& rng) {
 
   {
     nn::TransformerBlockSpec spec = tiny_block_spec();
+    spec.use_rope = true;
+    nn::TransformerBlock block(ctx, spec, rng);
+    expect_named(block, {{"ln1.weight", {8}},
+                         {"attn.q.weight", {8, 8}},
+                         {"attn.k.weight", {8, 8}},
+                         {"attn.v.weight", {8, 8}},
+                         {"attn.out.weight", {8, 8}},
+                         {"ln2.weight", {8}},
+                         {"fc1.weight", {32, 8}},
+                         {"fc2.weight", {8, 16}}});
+    CHECK(block.parameters()[1].name == "attn.q.weight");
+    CHECK(block.forward(input).shape() == std::vector<int>({1, 3, 8}));
+    for (const nn::NamedParam& param : block.parameters()) {
+      CHECK(param.name.find(".bias") == std::string::npos);
+    }
+  }
+
+  {
+    nn::TransformerBlockSpec spec = tiny_block_spec();
     spec.dropout = 0.5f;
     nn::TransformerBlock block(ctx, spec, rng);
     block.set_training(true);
@@ -725,6 +781,18 @@ void check_cached_decode(nn::Context& ctx, std::mt19937& rng) {
       const std::vector<float> got = layer.forward_cached(step, cache).to_host();
       expect_close(got, position_row(full, 0, 3, t, 8), "mha-cache");
       CHECK(cache.t == t + 1);
+    }
+    nn::MultiHeadAttention rope(ctx, 8, 2, true, false, true, rng);
+    nn::MultiHeadAttention::Cache rope_cache{nn::Tensor(ctx, {1, 1, 1, 1}),
+                                             nn::Tensor(ctx, {1, 1, 1, 1}), 0};
+    rope.reset_cache(rope_cache, 1, 3);
+    const std::vector<float> rope_full = rope.forward(sequence).to_host();
+    for (int t = 0; t < 3; ++t) {
+      nn::Tensor step(ctx, {1, 1, 8});
+      step.copy_from_host(std::vector<float>(host.begin() + t * 8, host.begin() + (t + 1) * 8));
+      const std::vector<float> got = rope.forward_cached(step, rope_cache).to_host();
+      expect_close(got, position_row(rope_full, 0, 3, t, 8), "mha-rope-cache");
+      CHECK(rope_cache.t == t + 1);
     }
     nn::Tensor extra(ctx, {1, 1, 8});
     extra.fill(0.1f);
@@ -830,6 +898,39 @@ void check_cached_decode(nn::Context& ctx, std::mt19937& rng) {
   const std::vector<int64_t> ids = {0, 1, 2};
   too_long.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
   expect_invalid([&] { model.prefill(too_long, st, 2); }, "t_max");
+
+  config.positional = nn::PositionalEncoding::Rope;
+  nn::Transformer rope_model(ctx, config, 9);
+  rope_model.eval();
+  const std::vector<nn::NamedParam> rope_params = rope_model.parameters();
+  CHECK(rope_params[0].name == "tok_emb.weight");
+  CHECK(rope_params[1].name == "blocks.0.ln1.weight");
+  for (const nn::NamedParam& param : rope_params) {
+    CHECK(param.name.find("pos_emb") == std::string::npos);
+    CHECK(param.name.find(".bias") == std::string::npos);
+  }
+  for (int length = 1; length <= 3; ++length) {
+    nn::IndexTensor tokens(ctx, {1, length});
+    tokens.copy_from_host(prompt.data(), length);
+    const std::vector<float> full = rope_model.forward(tokens).to_host();
+    const std::vector<float> want = position_row(full, 0, length, length - 1, config.vocab_size);
+    nn::Transformer::GenerateState stepped;
+    rope_model.reset_generate_state(stepped, 1, config.max_seq_len);
+    const nn::Tensor* logits = nullptr;
+    for (int t = 0; t < length; ++t) {
+      nn::IndexTensor step(ctx, {1, 1});
+      step.copy_from_host(&prompt[static_cast<size_t>(t)], 1);
+      logits = &rope_model.decode_step(step, stepped);
+    }
+    expect_close(logits->to_host(), want, "rope-decode-last");
+    nn::Transformer::GenerateState prefilled;
+    expect_close(rope_model.prefill(tokens, prefilled, config.max_seq_len).to_host(), want,
+                 "rope-prefill-last");
+  }
+  nn::Transformer::GenerateState rope_state;
+  rope_model.reset_generate_state(rope_state, 1, config.max_seq_len);
+  rope_state.t = config.max_seq_len;
+  expect_invalid([&] { rope_model.decode_step(one, rope_state); }, "max_seq_len");
 }
 
 }  // namespace
@@ -1122,6 +1223,56 @@ int test_shapes() {
   }
 
   {
+    expect_error([&] { nn::RMSNorm bad(ctx, 0); }, "RMSNorm size");
+    expect_error([&] { nn::RMSNorm bad(ctx, -1); }, "RMSNorm size");
+    expect_error([&] { nn::RMSNorm bad(ctx, 2, 0.f); }, "RMSNorm eps");
+    expect_error([&] { nn::RMSNorm bad(ctx, 2, -1.f); }, "RMSNorm eps");
+    expect_error([&] { nn::RMSNorm bad(ctx, 2, std::nanf("")); }, "RMSNorm eps");
+
+    constexpr float eps = 1e-5f;
+    nn::RMSNorm layer(ctx, 4, eps);
+    std::vector<nn::NamedParam> params = layer.parameters();
+    CHECK(params.size() == 1);
+    CHECK(params[0].name == "weight");
+    CHECK(params[0].value->shape() == std::vector<int>({4}));
+    const std::vector<float> weight = {0.5f, -1.f, 1.5f, 0.25f};
+    params[0].value->copy_from_host(weight);
+    const std::vector<float> host = {1.f, -2.f, 0.5f, 0.25f, 0.2f, 0.4f, -0.1f, 0.3f};
+    auto rms_ref = [&](const std::vector<float>& x, int rows, int cols) {
+      std::vector<float> y(x.size());
+      for (int row = 0; row < rows; ++row) {
+        double sq = 0.0;
+        for (int col = 0; col < cols; ++col) {
+          const double value = x[static_cast<size_t>(row * cols + col)];
+          sq += value * value;
+        }
+        const double inv = 1.0 / std::sqrt(sq / static_cast<double>(cols) + static_cast<double>(eps));
+        for (int col = 0; col < cols; ++col) {
+          y[static_cast<size_t>(row * cols + col)] = static_cast<float>(
+              x[static_cast<size_t>(row * cols + col)] * inv * static_cast<double>(weight[static_cast<size_t>(col)]));
+        }
+      }
+      return y;
+    };
+    nn::Tensor rank2(ctx, {2, 4});
+    rank2.copy_from_host(host);
+    expect_close(layer.forward(rank2).to_host(), rms_ref(host, 2, 4), "rmsnorm");
+    nn::Tensor rank3(ctx, {2, 1, 4});
+    rank3.copy_from_host(host);
+    expect_close(layer.forward(rank3).to_host(), rms_ref(host, 2, 4), "rmsnorm-rank3");
+    nn::Tensor bad_rank(ctx, {4});
+    expect_error([&] { layer.forward(bad_rank); }, "RMSNorm input shape");
+    nn::Tensor bad_last(ctx, {2, 3});
+    expect_error([&] { layer.forward(bad_last); }, "RMSNorm input shape");
+    nn::Tensor bad_grad(ctx, {2, 3});
+    expect_error([&] { layer.backward(bad_grad); }, "RMSNorm backward shape");
+    nn::RMSNorm fresh(ctx, 4);
+    nn::Tensor grad(ctx, {2, 4});
+    grad.fill(1.f);
+    expect_error([&] { fresh.backward(grad); }, "RMSNorm backward shape");
+  }
+
+  {
     expect_error([&] { nn::Dropout bad(ctx, 1.f); }, "Dropout p");
     expect_error([&] { nn::Dropout bad(ctx, -0.1f); }, "Dropout p");
     expect_error([&] { nn::Dropout bad(ctx, std::nanf("")); }, "Dropout p");
@@ -1389,7 +1540,10 @@ int test_shapes() {
 
     config.tie_embeddings = false;
     config.positional = nn::PositionalEncoding::Rope;
+    nn::validate(config);
+    config.d_model = 6;
     expect_invalid([&] { nn::validate(config); }, "use_rope");
+    config.d_model = 8;
     config.positional = static_cast<nn::PositionalEncoding>(0);
     expect_invalid([&] { nn::validate(config); }, "positional");
     config.positional = nn::PositionalEncoding::LearnedAbsolute;
@@ -1425,6 +1579,16 @@ int test_shapes() {
     }
     check_io(ctx, net, {1, 3, 8}, {1, 3, 10});
     check_io(ctx, net, {1, 5, 8}, {1, 5, 10});
+
+    config.positional = nn::PositionalEncoding::Rope;
+    nn::Network rope_net = nn::build_transformer_network(ctx, config, 1);
+    CHECK(has_param(rope_net, "blocks.0.ln1.weight"));
+    CHECK(has_param(rope_net, "final_ln.weight"));
+    CHECK(!has_param(rope_net, "final_ln.bias"));
+    CHECK(!has_param(rope_net, "blocks.0.ln1.bias"));
+    CHECK(!has_param(rope_net, "blocks.0.ln2.bias"));
+    check_io(ctx, rope_net, {1, 3, 8}, {1, 3, 10});
+    config.positional = nn::PositionalEncoding::LearnedAbsolute;
   }
 
   {

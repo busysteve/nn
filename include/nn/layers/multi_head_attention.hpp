@@ -32,6 +32,7 @@ class MultiHeadAttention : public Layer {
   int num_heads_;
   int head_dim_;
   bool causal_;
+  bool use_rope_ = false;
   std::unique_ptr<Linear> q_;
   std::unique_ptr<Linear> k_;
   std::unique_ptr<Linear> v_;

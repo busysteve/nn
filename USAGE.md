@@ -244,7 +244,7 @@ class Layer {
 };
 ```
 
-`Layer` is the abstract base. Construct a concrete layer with a `Context`, then call `forward` and `backward` yourself or hand ownership to a `Network` with `std::unique_ptr<Layer>`. `set_name` before the network is built. `buffers()` defaults to an empty list. `set_training` defaults to a no-op. `BatchNorm2d`, `Dropout`, `ResidualBlock`, and `TransformerBlock` honor it. `LayerNorm` ignores it: train and eval use the same math.
+`Layer` is the abstract base. Construct a concrete layer with a `Context`, then call `forward` and `backward` yourself or hand ownership to a `Network` with `std::unique_ptr<Layer>`. `set_name` before the network is built. `buffers()` defaults to an empty list. `set_training` defaults to a no-op. `BatchNorm2d`, `Dropout`, `ResidualBlock`, and `TransformerBlock` honor it. `LayerNorm` and `RMSNorm` ignore it: train and eval use the same math.
 
 `backward` reads the activation saved by the matching `forward`. Call `forward` on that layer before `backward`.
 
@@ -457,6 +457,28 @@ y = (x - mean) / sqrt(var + eps) * weight + bias
 
 A rank other than 2 or 3, or a last dimension other than `normalized_shape`, throws `LayerNorm input shape`. `backward` returns the input shape and adds into `grad_weight` and `grad_bias`. A missing forward or a mismatched gradient throws `LayerNorm backward shape`.
 
+### RMSNorm
+
+Header: `nn/layers/rms_norm.hpp`
+
+```cpp
+RMSNorm(Context& ctx, int normalized_shape, float eps = 1e-5f);
+```
+
+`normalized_shape` is at least 1 (`RMSNorm size`). `eps` is finite and greater than 0 (`RMSNorm eps`). The default is `1e-5`.
+
+`weight` has shape `(normalized_shape)` and starts at 1. There is no bias. The name is `weight`. There are no buffers. `set_training` does not change the result.
+
+`forward` accepts rank 2 `(N, normalized_shape)` or rank 3 `(N, T, normalized_shape)` and returns the same shape. The scale is the root-mean-square of the last dimension:
+
+```
+y = x * rsqrt(mean(x^2) + eps) * weight
+```
+
+A rank other than 2 or 3, or a last dimension other than `normalized_shape`, throws `RMSNorm input shape`. `backward` returns the input shape and adds into `grad_weight`. A missing forward or a mismatched gradient throws `RMSNorm backward shape`.
+
+The RoPE transformer path uses this norm for `ln1`, `ln2`, and `final_ln`. Learned absolute positions keep LayerNorm.
+
 ### Dropout
 
 Header: `nn/layers/dropout.hpp`
@@ -482,7 +504,7 @@ MultiHeadAttention(Context& ctx, int d_model, int num_heads, bool causal, bool u
                    bool use_rope, std::mt19937& rng);
 ```
 
-`d_model` and `num_heads` are at least 1, and `d_model` must be divisible by `num_heads` (`MultiHeadAttention size`). `use_rope == true` throws `std::invalid_argument` with message `use_rope`. Rotary positions are not implemented. There is no attention dropout. `set_training` does not change the result.
+`d_model` and `num_heads` are at least 1, and `d_model` must be divisible by `num_heads` (`MultiHeadAttention size`). `use_rope == true` applies llama.cpp's default `LLAMA_ROPE_TYPE_NORM` rotation to Q and K after the head split: adjacent pairs inside each head, base 10000, over the whole head dimension `d_model / num_heads`. V is not rotated. An odd head dimension throws `std::invalid_argument` with message `use_rope`. `forward` uses positions `0 .. T-1`. `forward_cached` rotates the new token at `cache.t` before that key is stored. There is no attention dropout. `set_training` does not change the result.
 
 The layer owns four `Linear` children, each `d_model` to `d_model`, constructed in order `q`, `k`, `v`, `out`. Each child uses `use_bias` and draws its weight from `rng`. Bias, when present, starts at 0 and consumes no random numbers. Parameter names are the child prefix plus the linear name:
 
@@ -506,7 +528,7 @@ void reset_cache(Cache& cache, int batch, int t_max) const;
 const Tensor& forward_cached(const Tensor& x_t, Cache& cache);
 ```
 
-`reset_cache` allocates `k` and `v` on this context, zeros them, and sets `t = 0`. `batch < 1` throws `batch`. `t_max < 1` throws `t_max`. Replacing a cache is fine. `forward_cached` is the generation step. `x_t` must be `(N, 1, d_model)` on this context (`x_t`). `N` must match the cache batch and `cache.t` must be less than `T_max` (`cache`). The step projects that token, writes K and V at `cache.t`, and attends over keys `0 .. cache.t` inclusive. Scores are `(N, num_heads, 1, cache.t + 1)`, scaled by `1/sqrt(Dh)`, then the same max-subtract softmax as `forward`. The unwritten tail is not read, and there is no `(T, T)` mask. The return is `(N, 1, d_model)`. `cache.t` then increases by 1. `backward` after `forward_cached` throws `forward_cached` instead of the full-sequence backward. A later `forward` clears that state.
+`reset_cache` allocates `k` and `v` on this context, zeros them, and sets `t = 0`. `batch < 1` throws `batch`. `t_max < 1` throws `t_max`. Replacing a cache is fine. `forward_cached` is the generation step. `x_t` must be `(N, 1, d_model)` on this context (`x_t`). `N` must match the cache batch and `cache.t` must be less than `T_max` (`cache`). The step projects that token, rotates Q and K when `use_rope` is set, writes K and V at `cache.t`, and attends over keys `0 .. cache.t` inclusive. Scores are `(N, num_heads, 1, cache.t + 1)`, scaled by `1/sqrt(Dh)`, then the same max-subtract softmax as `forward`. The unwritten tail is not read, and there is no `(T, T)` mask. The return is `(N, 1, d_model)`. `cache.t` then increases by 1. `backward` after `forward_cached` throws `forward_cached` instead of the full-sequence backward. A later `forward` clears that state. Full-sequence backward undoes the Q and K rotation before the linear gradients.
 
 ### TransformerBlock
 
@@ -529,7 +551,7 @@ MultiHeadAttention& attn();
 
 `TransformerActivation` is defined once in `nn/config.hpp` and included by this header.
 
-Pre-norm block. There is no fourth constructor argument. `d_model`, `num_heads`, and `d_ff` are at least 1, and `d_model` must be divisible by `num_heads` (`TransformerBlock size`). `dropout` is in `[0, 1)` (`TransformerBlock dropout`). Any other `activation` throws `TransformerBlock activation`. `use_rope` is passed through to causal `MultiHeadAttention`; `true` throws `std::invalid_argument` with message `use_rope`.
+Pre-norm block. There is no fourth constructor argument. `d_model`, `num_heads`, and `d_ff` are at least 1, and `d_model` must be divisible by `num_heads` (`TransformerBlock size`). `dropout` is in `[0, 1)` (`TransformerBlock dropout`). Any other `activation` throws `TransformerBlock activation`. `use_rope` false builds LayerNorm for `ln1` and `ln2` and leaves attention unrotated. `use_rope` true builds RMSNorm for both norms and passes the flag to causal `MultiHeadAttention`. An odd head dimension throws `std::invalid_argument` with message `use_rope`.
 
 ```
 h = x + drop1(mha(ln1(x)))
@@ -790,9 +812,9 @@ struct TransformerConfig {
 };
 ```
 
-`validate` requires `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, and `max_seq_len` to be at least 1. `d_model % num_heads != 0` throws `num_heads`. `dropout` must be in `[0, 1)`, or the call throws `dropout`. `tie_embeddings == true` throws `tie_embeddings`. `activation` is `Gelu` or `SwiGLU`; any other value throws `activation`. `positional == LearnedAbsolute` is accepted. `Rope` throws `use_rope`. Any other value throws `positional`. When `activation` is SwiGLU and `2 * d_ff` does not fit in a positive `int`, `validate` throws `d_ff`. GELU does not double `d_ff`.
+`validate` requires `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, and `max_seq_len` to be at least 1. `d_model % num_heads != 0` throws `num_heads`. `dropout` must be in `[0, 1)`, or the call throws `dropout`. `tie_embeddings == true` throws `tie_embeddings`. `activation` is `Gelu` or `SwiGLU`; any other value throws `activation`. `positional == LearnedAbsolute` keeps LayerNorm and a position table. `positional == Rope` keeps RMSNorm and adjacent-pair RoPE, and throws `use_rope` when `d_model / num_heads` is odd. Any other value throws `positional`. When `activation` is SwiGLU and `2 * d_ff` does not fit in a positive `int`, `validate` throws `d_ff`. GELU does not double `d_ff`.
 
-`Family::Transformer` is `6`. `build_transformer_network` emits `num_layers` `TransformerBlock`s named `blocks.i`, then `LayerNorm` named `final_ln` (default eps `1e-5`), then `Linear` named `lm_head` from `d_model` to `vocab_size`. The trunk is those blocks, the final LayerNorm, and `lm_head`. It does not own token embeddings or a position table. Each block is built with `use_rope` false. `max_seq_len` is stored on the config and in the checkpoint only.
+`Family::Transformer` is `6`. `build_transformer_network` emits `num_layers` `TransformerBlock`s named `blocks.i`, then a final norm named `final_ln` (default eps `1e-5`), then `Linear` named `lm_head` from `d_model` to `vocab_size`. The trunk is those blocks, the final norm, and `lm_head`. It does not own token embeddings or a position table. Each block sets `use_rope` when `positional` is `Rope`, and the final norm is RMSNorm on that path and LayerNorm otherwise. `max_seq_len` is stored on the config and in the checkpoint only.
 
 Forward input is a float tensor `(N, T, d_model)`. Output is `(N, T, vocab_size)`. The trunk does not check `T` against `max_seq_len`.
 
@@ -814,7 +836,7 @@ const nn::Tensor& logits = net.forward(hidden);  // (1, 3, 10)
 
 Header: `nn/transformer.hpp`
 
-`Transformer` owns `tok_emb` and the learned-absolute `pos_emb` outside the trunk. The trunk is a family-6 `Network`: `blocks.i`, `final_ln`, and `lm_head`. Those embeddings are not layers of the network.
+`Transformer` owns `tok_emb` outside the trunk, and the learned-absolute `pos_emb` when `positional` is `LearnedAbsolute`. RoPE leaves `pos_emb` null and does not add a position vector. The trunk is a family-6 `Network`: `blocks.i`, `final_ln`, and `lm_head`. Those embeddings are not layers of the network.
 
 ```cpp
 class Transformer {
@@ -855,13 +877,13 @@ struct Transformer::Loaded {
 };
 ```
 
-`forward(const IndexTensor&)` reads token ids of shape `(N, T)` and returns logits `(N, T, vocab_size)`. Rank other than 2 throws `tokens`. `T > max_seq_len` throws `max_seq_len` before either embedding runs. Learned-absolute positions are the column index `0 .. T-1` on every row, added to the token embedding. `forward(const Tensor&)` reads a float tensor `(N, T, d_model)` and skips both embeddings. A rank or width mismatch throws `embeddings`. Backward after that hook does not update embedding gradients. Full `forward` does not fill the KV cache.
+`forward(const IndexTensor&)` reads token ids of shape `(N, T)` and returns logits `(N, T, vocab_size)`. Rank other than 2 throws `tokens`. `T > max_seq_len` throws `max_seq_len` before either embedding runs. Learned-absolute positions are the column index `0 .. T-1` on every row, added to the token embedding. RoPE forwards the token embedding alone. `forward(const Tensor&)` reads a float tensor `(N, T, d_model)` and skips both embeddings. A rank or width mismatch throws `embeddings`. Backward after that hook does not update embedding gradients. Full `forward` does not fill the KV cache. Backward of a token forward updates `tok_emb` and, when the position table exists, `pos_emb`.
 
-`reset_generate_state` builds one cache per block (`attn().reset_cache`) and sets `st.t = 0`. `decode_step` requires `eval()`; `training()` throws `decode_step`. `next_ids` is `(N, 1)` (`next_ids`) and `N` must match the cache batch (`cache`). Learned-absolute positions are the index `st.t` on every row. `st.t >= max_seq_len` throws `max_seq_len` before that upload. Each block writes its cache at that same index, then `st.t` increases by 1. The return is the `lm_head` tensor `(N, 1, vocab_size)`. `prefill` resets, then runs `decode_step` once per prompt column, and returns the last step's logits. `prompt_ids` is `(N, T_prompt)` with `1 <= T_prompt <= t_max` (`prompt_ids`, `t_max`). `GenerateState` is not written by `save`.
+`reset_generate_state` builds one cache per block (`attn().reset_cache`) and sets `st.t = 0`. `decode_step` requires `eval()`; `training()` throws `decode_step`. `next_ids` is `(N, 1)` (`next_ids`) and `N` must match the cache batch (`cache`). `st.t >= max_seq_len` throws `max_seq_len` before the position upload and before the cache write. Learned-absolute positions are the index `st.t` on every row. RoPE rotates Q and K at that same index and does not add a position vector. Each block writes its cache at that index, then `st.t` increases by 1. The return is the `lm_head` tensor `(N, 1, vocab_size)`. `prefill` resets, then runs `decode_step` once per prompt column, and returns the last step's logits. `prompt_ids` is `(N, T_prompt)` with `1 <= T_prompt <= t_max` (`prompt_ids`, `t_max`). `GenerateState` is not written by `save`.
 
-`parameters()` is `tok_emb.weight`, then `pos_emb.weight`, then `network().parameters()`. `network().parameters()` does not include `tok_emb` or `pos_emb`.
+`parameters()` is `tok_emb.weight`, then `pos_emb.weight` when that embedding exists, then `network().parameters()`. `network().parameters()` does not include `tok_emb` or `pos_emb`. A RoPE parameter list has no `pos_emb.weight` and no `.bias` on `ln1`, `ln2`, or `final_ln`.
 
-`save(path, nullptr)` writes version 1 with no optimizer block. `save(path, sgd)` writes version 2 and optimizer kind `1` (SGD) before the SGD body. `save(path, adamw)` writes version 2 and optimizer kind `2` (AdamW) followed by the AdamW moments. The flattened groups must match `parameters()` in order, or save throws `optimizer does not belong to this network`. `save(path, static_cast<const AdamW*>(nullptr))` writes version 2 with `optimizer_present` 0 and no optimizer block. Every façade file includes `tok_emb.weight` and `pos_emb.weight`, then the trunk parameters. `LoadMode::Resume` restores SGD into `Loaded::optimizer` or AdamW into `Loaded::adamw`, and leaves the other empty. `LoadMode::Inference` leaves both empty. A version-2 kind other than 1 or 2 throws `unsupported optimizer kind N`. `Network::load` accepts version 1 and version 2. A façade file fails that load on parameter count because the trunk has no embeddings.
+`save(path, nullptr)` writes version 1 with no optimizer block. `save(path, sgd)` writes version 2 and optimizer kind `1` (SGD) before the SGD body. `save(path, adamw)` writes version 2 and optimizer kind `2` (AdamW) followed by the AdamW moments. The flattened groups must match `parameters()` in order, or save throws `optimizer does not belong to this network`. `save(path, static_cast<const AdamW*>(nullptr))` writes version 2 with `optimizer_present` 0 and no optimizer block. Every façade file includes `tok_emb.weight`. A learned-absolute file then includes `pos_emb.weight` and the trunk parameters, including norm biases. A RoPE file goes straight to the trunk, and those norms have a weight only. The loader rebuilds the parameter list from `positional`, so both shapes load. `LoadMode::Resume` restores SGD into `Loaded::optimizer` or AdamW into `Loaded::adamw`, and leaves the other empty. `LoadMode::Inference` leaves both empty. A version-2 kind other than 1 or 2 throws `unsupported optimizer kind N`. `Network::load` accepts version 1 and version 2. A façade file fails that load on parameter count because the trunk has no embeddings.
 
 ```cpp
 nn::Transformer model(ctx, config, /*seed=*/1);

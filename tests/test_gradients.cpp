@@ -13,6 +13,7 @@
 #include "nn/layers/multi_head_attention.hpp"
 #include "nn/layers/relu.hpp"
 #include "nn/layers/residual_block.hpp"
+#include "nn/layers/rms_norm.hpp"
 #include "nn/layers/rnn.hpp"
 #include "nn/layers/swiglu.hpp"
 #include "nn/layers/transformer_block.hpp"
@@ -281,6 +282,26 @@ int test_gradients() {
     check_layer(layer, input);
   }
 
+  std::printf("grad rmsnorm\n");
+  {
+    std::mt19937 local(11);
+    nn::RMSNorm layer(ctx, 5);
+    nn::Tensor input(ctx, {4, 5});
+    input.copy_from_host(uniform(input.numel(), local, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad rmsnorm rank3\n");
+  {
+    std::mt19937 local(12);
+    nn::RMSNorm layer(ctx, 4);
+    std::vector<nn::NamedParam> params = layer.parameters();
+    params[0].value->copy_from_host(std::vector<float>{0.5f, -1.f, 1.5f, 0.25f});
+    nn::Tensor input(ctx, {2, 3, 4});
+    input.copy_from_host(uniform(input.numel(), local, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
   std::printf("grad dropout p0\n");
   {
     nn::Dropout layer(ctx, 0.f);
@@ -424,6 +445,15 @@ int test_gradients() {
     check_layer(layer, input);
   }
 
+  std::printf("grad mha rope\n");
+  {
+    std::mt19937 local(13);
+    nn::MultiHeadAttention layer(ctx, 4, 2, true, false, true, local);
+    nn::Tensor input(ctx, {1, 3, 4});
+    input.copy_from_host(uniform(input.numel(), local, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
   std::printf("grad transformer swiglu\n");
   {
     nn::TransformerBlockSpec spec;
@@ -436,6 +466,23 @@ int test_gradients() {
     nn::TransformerBlock layer(ctx, spec, rng);
     nn::Tensor input(ctx, {1, 3, 8});
     input.copy_from_host(uniform(input.numel(), rng, -0.5f, 0.5f));
+    check_layer(layer, input);
+  }
+
+  std::printf("grad transformer rope\n");
+  {
+    std::mt19937 local(14);
+    nn::TransformerBlockSpec spec;
+    spec.d_model = 8;
+    spec.num_heads = 2;
+    spec.d_ff = 16;
+    spec.dropout = 0.f;
+    spec.bias = false;
+    spec.use_rope = true;
+    spec.activation = nn::TransformerActivation::SwiGLU;
+    nn::TransformerBlock layer(ctx, spec, local);
+    nn::Tensor input(ctx, {1, 3, 8});
+    input.copy_from_host(uniform(input.numel(), local, -0.5f, 0.5f));
     check_layer(layer, input);
   }
 

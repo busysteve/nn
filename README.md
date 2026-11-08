@@ -372,15 +372,15 @@ Input shape is `(N, T, input_size)`. Output shape is `(N, output_size)`. `T` is 
 | `tie_embeddings` | Must be false. `true` throws `tie_embeddings`. |
 | `bias` | When true, attention projections, the block linears, and `lm_head` have a bias. |
 | `activation` | `TransformerActivation::Gelu` (`1`) or `SwiGLU` (`2`). Any other value throws `activation`. |
-| `positional` | `PositionalEncoding::LearnedAbsolute` (`1`) is accepted. `Rope` (`2`) throws `use_rope`. Any other value throws `positional`. |
+| `positional` | `LearnedAbsolute` (`1`) adds a position table and uses LayerNorm. `Rope` (`2`) uses RMSNorm and adjacent-pair RoPE on Q and K when the head dimension is even. An odd head dimension throws `use_rope`. Any other value throws `positional`. |
 
-`Family::Transformer` is `6`. `validate` checks the fields above. `build_transformer_network` emits one `TransformerBlock` per layer, named `blocks.i`, then `LayerNorm` named `final_ln` (default eps `1e-5`), then `Linear` named `lm_head` from `d_model` to `vocab_size`. The trunk is those blocks, the final LayerNorm, and `lm_head`. It does not own token embeddings or a position table. Each block is built with `use_rope` false. Forward input is a float tensor `(N, T, d_model)`. Output is `(N, T, vocab_size)`. `T` is not checked against `max_seq_len`.
+`Family::Transformer` is `6`. `validate` checks the fields above. `build_transformer_network` emits one `TransformerBlock` per layer, named `blocks.i`, then a final norm named `final_ln` (default eps `1e-5`), then `Linear` named `lm_head` from `d_model` to `vocab_size`. Learned absolute uses LayerNorm. RoPE uses RMSNorm, which has a weight and no bias. The trunk is those blocks, the final norm, and `lm_head`. It does not own token embeddings or a position table. Each block sets `use_rope` from `positional == Rope`. Forward input is a float tensor `(N, T, d_model)`. Output is `(N, T, vocab_size)`. `T` is not checked against `max_seq_len`.
 
 ### Transformer
 
 Header: `nn/transformer.hpp`.
 
-`Transformer` is a façade. It owns the token embedding and the learned-absolute position embedding outside `Network`. The network is the family-6 trunk: `blocks.i`, `final_ln`, and `lm_head`.
+`Transformer` is a façade. It owns the token embedding outside `Network`, and a learned-absolute position embedding when `positional` is `LearnedAbsolute`. RoPE leaves that table out. The network is the family-6 trunk: `blocks.i`, `final_ln`, and `lm_head`.
 
 ```cpp
 Transformer model(ctx, config, /*seed=*/1);
@@ -390,9 +390,9 @@ const nn::Tensor& hooked = model.forward(hidden);  // float (N, T, d_model) -> (
 
 `tokens` has rank 2. `T > max_seq_len` throws `max_seq_len` before either embedding runs. Learned-absolute positions are the column index `0 .. T-1` on every row. The float `forward` skips both embeddings. Backward on that path does not change their gradients.
 
-`parameters()` is `tok_emb.weight`, then `pos_emb.weight`, then `network().parameters()` (`blocks.0.ln1.weight`, ..., `final_ln.weight`, `lm_head.weight`). `network().parameters()` does not include `tok_emb`.
+`parameters()` is `tok_emb.weight`, then `pos_emb.weight` when the position table exists, then `network().parameters()` (`blocks.0.ln1.weight`, ..., `final_ln.weight`, `lm_head.weight`). A RoPE model has no `pos_emb.weight` and no norm bias. `network().parameters()` does not include `tok_emb`.
 
-`save(path, nullptr)` writes version 1, family 6, no optimizer block, and those parameters, including `tok_emb.weight` and `pos_emb.weight`. `save(path, sgd)` writes version 2 with `optimizer_present` 1 and optimizer kind `1` (SGD) followed by the SGD body. `save(path, adamw)` writes version 2 with optimizer kind `2` (AdamW) and the AdamW moments. The flattened groups must be `parameters()` in order. `save(path, static_cast<const AdamW*>(nullptr))` writes version 2 with `optimizer_present` 0 and no optimizer block. `load` in `LoadMode::Resume` restores SGD into `Loaded::optimizer` or AdamW into `Loaded::adamw`, and leaves the other empty. `LoadMode::Inference` leaves both empty. A version-2 kind other than 1 or 2 throws `unsupported optimizer kind N`. `Network::load` accepts version 1 and version 2. A façade file fails that load on parameter count because the trunk has no embeddings.
+`save(path, nullptr)` writes version 1, family 6, no optimizer block, and those parameters, including `tok_emb.weight` and, for learned absolute positions, `pos_emb.weight`. `save(path, sgd)` writes version 2 with `optimizer_present` 1 and optimizer kind `1` (SGD) followed by the SGD body. `save(path, adamw)` writes version 2 with optimizer kind `2` (AdamW) and the AdamW moments. The flattened groups must be `parameters()` in order. `save(path, static_cast<const AdamW*>(nullptr))` writes version 2 with `optimizer_present` 0 and no optimizer block. `load` in `LoadMode::Resume` restores SGD into `Loaded::optimizer` or AdamW into `Loaded::adamw`, and leaves the other empty. `LoadMode::Inference` leaves both empty. A version-2 kind other than 1 or 2 throws `unsupported optimizer kind N`. `Network::load` accepts version 1 and version 2. A façade file fails that load on parameter count because the trunk has no embeddings.
 
 ### MNIST shapes
 
@@ -703,7 +703,7 @@ ConvResNet: `in_channels`, `in_height`, `in_width`, `stem_channels`, pool kernel
 
 RNN: `input_size`, `output_size`, hidden count `uint32`, then that many widths.
 
-Transformer (`6`): `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, `max_seq_len` (`int32`), `dropout` (float32), then `tie_embeddings`, `bias`, `activation`, and `positional` (`uint32`). The two flags are `0` or `1`. `activation` is `1` GELU or `2` SwiGLU. `positional` is `1` learned absolute. The same version-1 layout follows: pad to 8 bytes, then parameter records, then a batch-norm count of 0.
+Transformer (`6`): `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, `max_seq_len` (`int32`), `dropout` (float32), then `tie_embeddings`, `bias`, `activation`, and `positional` (`uint32`). The two flags are `0` or `1`. `activation` is `1` GELU or `2` SwiGLU. `positional` is `1` learned absolute or `2` RoPE. The same version-1 layout follows: pad to 8 bytes, then parameter records, then a batch-norm count of 0. A RoPE file has no `pos_emb.weight` and no norm bias. A learned-absolute file still has both.
 
 `load` runs `validate` on the decoded config and then the same builder that created the network.
 
@@ -751,7 +751,7 @@ Present only when the header flag is 1.
 
 A count or numel mismatch throws `optimizer state mismatch`.
 
-`Transformer::save` with an `Sgd*` writes version `2` and, immediately before this body, a `uint32` kind. Kind `1` is SGD. Kind `2` is AdamW and uses the AdamW payload instead of this body. `Transformer::save` with a null `Sgd*` (`nullptr`) writes version `1` and omits the kind and the body. `Transformer::save` with a null `AdamW*` writes version `2` and omits the kind and the body. `Transformer::load` of version 1 reads this body when the optimizer flag is set, with no kind tag. A kind other than `1` or `2` throws `unsupported optimizer kind N`. Resume of kind `2` fills `Loaded::adamw` and leaves `optimizer` empty. Parameter records in a façade file are `tok_emb.weight`, `pos_emb.weight`, then the trunk names.
+`Transformer::save` with an `Sgd*` writes version `2` and, immediately before this body, a `uint32` kind. Kind `1` is SGD. Kind `2` is AdamW and uses the AdamW payload instead of this body. `Transformer::save` with a null `Sgd*` (`nullptr`) writes version `1` and omits the kind and the body. `Transformer::save` with a null `AdamW*` writes version `2` and omits the kind and the body. `Transformer::load` of version 1 reads this body when the optimizer flag is set, with no kind tag. A kind other than `1` or `2` throws `unsupported optimizer kind N`. Resume of kind `2` fills `Loaded::adamw` and leaves `optimizer` empty. Parameter records in a learned-absolute façade file are `tok_emb.weight`, `pos_emb.weight`, then the trunk names. A RoPE file skips `pos_emb.weight` and every norm bias.
 
 An SGD payload in version 2 is that same body, after the kind tag.
 
@@ -858,4 +858,4 @@ At the start of the ResNet's last epoch the test zeros every `running_mean`, fil
 
 The library is a fixed set of layers with manual backward passes, six builders, one loss, SGD and AdamW, and checkpoint versions 1 and 2. `Network` checkpoints are version 1 for SGD or no optimizer and version 2 for AdamW. A `Transformer` checkpoint is version 1 without an optimizer and version 2 with SGD kind 1. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
 
-It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, ConvResNet models that can include a conv trunk, residual stages, or both, Elman RNNs, and a decoder-only transformer trunk of blocks, a final LayerNorm, and `lm_head`. That trunk reads a float tensor `(N, T, d_model)`. Conv, ResNet, and ConvResNet builders use ReLU. The training set exercised by the suite is MNIST.
+It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, ConvResNet models that can include a conv trunk, residual stages, or both, Elman RNNs, and a decoder-only transformer trunk of blocks, a final norm, and `lm_head`. That trunk reads a float tensor `(N, T, d_model)`. Conv, ResNet, and ConvResNet builders use ReLU. The training set exercised by the suite is MNIST.

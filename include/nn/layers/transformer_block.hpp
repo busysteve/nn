@@ -10,7 +10,6 @@
 
 namespace nn {
 
-class LayerNorm;
 class Dropout;
 class Linear;
 
@@ -20,7 +19,7 @@ struct TransformerBlockSpec {
   int d_ff = 0;           // width AFTER the gate. SwiGLU's first linear writes 2*d_ff.
   float dropout = 0.f;    // in [0, 1)
   bool bias = false;
-  bool use_rope = false;  // pass through to MultiHeadAttention. true throws today.
+  bool use_rope = false;  // RMSNorm, and adjacent-pair RoPE on Q and K. Odd head dim throws.
   TransformerActivation activation = TransformerActivation::SwiGLU;
 };
 
@@ -40,10 +39,10 @@ class TransformerBlock : public Layer {
  private:
   Context* ctx_;
   int d_model_;
-  std::unique_ptr<LayerNorm> ln1_;
+  std::unique_ptr<Layer> ln1_;
   std::unique_ptr<MultiHeadAttention> mha_;
   std::unique_ptr<Dropout> drop1_;
-  std::unique_ptr<LayerNorm> ln2_;
+  std::unique_ptr<Layer> ln2_;
   std::unique_ptr<Linear> fc1_;
   std::unique_ptr<Layer> act_;
   std::unique_ptr<Linear> fc2_;

@@ -70,6 +70,39 @@ __global__ void merge_heads_kernel(float* dst, const float* src, int time, int h
   dst[i] = src[s];
 }
 
+// llama.cpp LLAMA_ROPE_TYPE_NORM: adjacent pairs inside the head, base 10000, full head dim.
+// y0 = x0*cos - x1*sin, y1 = x0*sin + x1*cos. Inverse is the transpose of that rotation.
+__global__ void rope_qk_kernel(float* q, float* k, int time, int dh, int pos0, int64_t npairs,
+                               int inverse) {
+  const int64_t pair_index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (pair_index >= npairs) return;
+  const int pairs = dh / 2;
+  const int pair = static_cast<int>(pair_index % pairs);
+  const int64_t vec = pair_index / pairs;
+  const int t = static_cast<int>(vec % time);
+  const int64_t base = vec * dh + static_cast<int64_t>(pair) * 2;
+  const float theta =
+      static_cast<float>(pos0 + t) *
+      expf(-logf(10000.f) * (2.f * static_cast<float>(pair) / static_cast<float>(dh)));
+  const float c = cosf(theta);
+  const float s = sinf(theta);
+  const float q0 = q[base];
+  const float q1 = q[base + 1];
+  const float k0 = k[base];
+  const float k1 = k[base + 1];
+  if (inverse) {
+    q[base] = q0 * c + q1 * s;
+    q[base + 1] = -q0 * s + q1 * c;
+    k[base] = k0 * c + k1 * s;
+    k[base + 1] = -k0 * s + k1 * c;
+  } else {
+    q[base] = q0 * c - q1 * s;
+    q[base + 1] = q0 * s + q1 * c;
+    k[base] = k0 * c - k1 * s;
+    k[base + 1] = k0 * s + k1 * c;
+  }
+}
+
 __global__ void causal_mask_kernel(float* scores, int time, int64_t n) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -154,6 +187,14 @@ void launch_write_kv(cudaStream_t stream, float* dst, const float* src, int t, i
   check_cuda(cudaGetLastError(), "mha_write_kv");
 }
 
+void launch_rope(cudaStream_t stream, float* q, float* k, int time, int dh, int pos0, int64_t n,
+                 bool inverse) {
+  const int64_t npairs = n / 2;
+  rope_qk_kernel<<<blocks_for(npairs), kThreads, 0, stream>>>(q, k, time, dh, pos0, npairs,
+                                                             inverse ? 1 : 0);
+  check_cuda(cudaGetLastError(), "mha_rope");
+}
+
 // Row-major (T, Dh) occupies the same buffer as column-major (Dh, T).
 // S = scale * Q K^T  <=>  S_cm = scale * K_cm^T Q_cm.
 void gemm_scores(cublasHandle_t handle, const float* q, const float* k, float* scores, int time,
@@ -202,11 +243,10 @@ void append_params(std::vector<NamedParam>& out, const Layer& layer, const char*
 }
 
 Context* attention_context(Context& ctx, int d_model, int num_heads, bool use_rope) {
-  // RoPE is a later change. Reject it here so the flag cannot be stored and ignored.
-  if (use_rope) throw std::invalid_argument("use_rope");
   if (d_model < 1 || num_heads < 1 || d_model % num_heads != 0) {
     throw Error("MultiHeadAttention size");
   }
+  if (use_rope && ((d_model / num_heads) % 2 != 0)) throw std::invalid_argument("use_rope");
   return &ctx;
 }
 
@@ -219,6 +259,7 @@ MultiHeadAttention::MultiHeadAttention(Context& ctx, int d_model, int num_heads,
       num_heads_(num_heads),
       head_dim_(d_model / num_heads),
       causal_(causal),
+      use_rope_(use_rope),
       q_(std::make_unique<Linear>(*ctx_, d_model, d_model, use_bias, rng)),
       k_(std::make_unique<Linear>(*ctx_, d_model, d_model, use_bias, rng)),
       v_(std::make_unique<Linear>(*ctx_, d_model, d_model, use_bias, rng)),
@@ -267,6 +308,7 @@ const Tensor& MultiHeadAttention::forward(const Tensor& input) {
   launch_split_heads(stream, q_heads_->data(), q_->forward(input).data(), time, heads, dh, hidden);
   launch_split_heads(stream, k_heads_->data(), k_->forward(input).data(), time, heads, dh, hidden);
   launch_split_heads(stream, v_heads_->data(), v_->forward(input).data(), time, heads, dh, hidden);
+  if (use_rope_) launch_rope(stream, q_heads_->data(), k_heads_->data(), time, dh, 0, hidden, false);
 
   const float scale = 1.f / std::sqrt(static_cast<float>(dh));
   gemm_scores(handle, q_heads_->data(), k_heads_->data(), scores_->data(), time, dh, batch, scale);
@@ -335,6 +377,8 @@ const Tensor& MultiHeadAttention::forward_cached(const Tensor& x_t, Cache& cache
   launch_split_heads(stream, q_heads_->data(), q_->forward(x_t).data(), tq, heads, dh, hidden);
   launch_split_heads(stream, k_heads_->data(), k_->forward(x_t).data(), tq, heads, dh, hidden);
   launch_split_heads(stream, v_heads_->data(), v_->forward(x_t).data(), tq, heads, dh, hidden);
+  // Rotate this token at its absolute position before the cache stores K. V is not rotated.
+  if (use_rope_) launch_rope(stream, q_heads_->data(), k_heads_->data(), tq, dh, t, hidden, false);
   const int64_t kv_n = static_cast<int64_t>(batch) * dh;
   launch_write_kv(stream, cache.k.data(), k_heads_->data(), t, t_max, dh, kv_n);
   launch_write_kv(stream, cache.v.data(), v_heads_->data(), t, t_max, dh, kv_n);
@@ -409,6 +453,8 @@ const Tensor& MultiHeadAttention::backward(const Tensor& grad_output) {
   check_cuda(cudaGetLastError(), "mha_softmax_backward");
   gemm_dq(handle, k_heads_->data(), d_scores_->data(), d_q_->data(), time, dh, batch, scale);
   gemm_dk(handle, q_heads_->data(), d_scores_->data(), d_k_->data(), time, dh, batch, scale);
+  // dQ and dK are gradients of the rotated vectors. Undo the rotation before the linears.
+  if (use_rope_) launch_rope(stream, d_q_->data(), d_k_->data(), time, dh, 0, hidden, true);
 
   launch_merge_heads(stream, merged_grad_->data(), d_q_->data(), time, heads, dh, hidden);
   const Tensor& gq = q_->backward(*merged_grad_);

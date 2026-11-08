@@ -11,7 +11,7 @@
 namespace nn {
 
 class TransformerBlock;
-class LayerNorm;
+class Layer;
 class Linear;
 
 class Transformer {
@@ -59,7 +59,7 @@ class Transformer {
   std::unique_ptr<Embedding> tok_emb_;
   std::unique_ptr<Embedding> pos_emb_;
   std::vector<TransformerBlock*> block_ptrs_;
-  LayerNorm* final_ln_ptr_ = nullptr;
+  Layer* final_ln_ptr_ = nullptr;
   Linear* lm_head_ptr_ = nullptr;
   std::optional<Network> network_;
   std::optional<Tensor> embedded_;

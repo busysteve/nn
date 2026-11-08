@@ -39,6 +39,7 @@ add_library(nn STATIC
   src/gelu.cpp
   src/swiglu.cpp
   src/layer_norm.cu
+  src/rms_norm.cu
   src/dropout.cpp
   src/multi_head_attention.cu
   src/transformer_block.cpp

@@ -836,6 +836,40 @@ int test_checkpoint() {
     expect_throw([&] { nn::Transformer::load(ctx, dir / "facade-adamw-null.bin", nn::LoadMode::Resume); },
                  "optimizer block missing");
   }
+  {
+    nn::TransformerConfig config;
+    config.vocab_size = 10;
+    config.d_model = 8;
+    config.num_heads = 2;
+    config.num_layers = 1;
+    config.d_ff = 16;
+    config.max_seq_len = 4;
+    config.dropout = 0.f;
+    config.bias = false;
+    config.activation = nn::TransformerActivation::SwiGLU;
+    config.positional = nn::PositionalEncoding::Rope;
+    nn::Transformer model(ctx, config, 3);
+    const std::vector<nn::NamedParam> params = model.parameters();
+    CHECK(params[1].name == "blocks.0.ln1.weight");
+    for (const nn::NamedParam& param : params) {
+      CHECK(param.name.find("pos_emb") == std::string::npos);
+      CHECK(param.name.size() < 5 || param.name.compare(param.name.size() - 5, 5, ".bias") != 0);
+    }
+    const std::filesystem::path path = dir / "facade-rope.bin";
+    model.save(path, nullptr);
+    nn::IndexTensor tokens(ctx, {1, 3});
+    const std::vector<int64_t> ids = {1, 0, 2};
+    tokens.copy_from_host(ids.data(), static_cast<int64_t>(ids.size()));
+    const std::vector<float> logits = model.forward(tokens).to_host();
+    nn::Transformer::Loaded loaded = nn::Transformer::load(ctx, path, nn::LoadMode::Inference);
+    CHECK(loaded.model.parameters().size() == params.size());
+    for (size_t i = 0; i < params.size(); ++i) {
+      CHECK(loaded.model.parameters()[i].name == params[i].name);
+      expect_bits(loaded.model.parameters()[i].value->to_host(), params[i].value->to_host(),
+                  params[i].name.c_str());
+    }
+    expect_bits(loaded.model.forward(tokens).to_host(), logits, "rope logits");
+  }
 
   std::printf("ckpt ok\n");
   return 0;

@@ -7,6 +7,7 @@
 #include "nn/error.hpp"
 #include "nn/layers/layer_norm.hpp"
 #include "nn/layers/linear.hpp"
+#include "nn/layers/rms_norm.hpp"
 #include "nn/layers/transformer_block.hpp"
 
 #include <random>
@@ -45,7 +46,8 @@ Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t
   block_spec.dropout = config.dropout;
   block_spec.bias = config.bias;
   block_spec.activation = config.activation;
-  block_spec.use_rope = false;
+  const bool rope = config.positional == PositionalEncoding::Rope;
+  block_spec.use_rope = rope;
 
   std::vector<std::unique_ptr<Layer>> layers;
   for (int i = 0; i < config.num_layers; ++i) {
@@ -54,7 +56,12 @@ Transformer::Transformer(Context& ctx, const TransformerConfig& config, uint32_t
     block_ptrs_.push_back(block.get());  // before the move
     layers.push_back(std::move(block));
   }
-  auto final_ln = std::make_unique<LayerNorm>(ctx, config.d_model);
+  std::unique_ptr<Layer> final_ln;
+  if (rope) {
+    final_ln = std::make_unique<RMSNorm>(ctx, config.d_model);
+  } else {
+    final_ln = std::make_unique<LayerNorm>(ctx, config.d_model);
+  }
   final_ln->set_name("final_ln");
   final_ln_ptr_ = final_ln.get();
   layers.push_back(std::move(final_ln));
@@ -72,22 +79,26 @@ const Tensor& Transformer::forward(const IndexTensor& tokens) {
   if (t > transformer_config(*network_).max_seq_len) throw std::invalid_argument("max_seq_len");
 
   const Tensor& tok = tok_emb_->forward_indices(tokens);
-  if (!pos_ids_ || pos_ids_->shape()[0] != n || pos_ids_->shape()[1] != t) {
-    pos_ids_.emplace(*ctx_, std::vector<int>{n, t});
-    std::vector<int64_t> host(static_cast<size_t>(pos_ids_->numel()));
-    for (int row = 0; row < n; ++row) {
-      for (int col = 0; col < t; ++col) {
-        host[static_cast<size_t>(row) * static_cast<size_t>(t) + static_cast<size_t>(col)] = col;
+  const Tensor* x = &tok;
+  if (pos_emb_) {
+    if (!pos_ids_ || pos_ids_->shape()[0] != n || pos_ids_->shape()[1] != t) {
+      pos_ids_.emplace(*ctx_, std::vector<int>{n, t});
+      std::vector<int64_t> host(static_cast<size_t>(pos_ids_->numel()));
+      for (int row = 0; row < n; ++row) {
+        for (int col = 0; col < t; ++col) {
+          host[static_cast<size_t>(row) * static_cast<size_t>(t) + static_cast<size_t>(col)] = col;
+        }
       }
+      pos_ids_->copy_from_host(host.data(), pos_ids_->numel());
+      // copy_from_host is async; the local buffer has to stay alive until it finishes.
+      ctx_->synchronize();
     }
-    pos_ids_->copy_from_host(host.data(), pos_ids_->numel());
-    // copy_from_host is async; the local buffer has to stay alive until it finishes.
-    ctx_->synchronize();
+    const Tensor& pos = pos_emb_->forward_indices(*pos_ids_);
+    ensure_tensor(embedded_, *ctx_, tok.shape());
+    launch_add2(stream_of(*ctx_), embedded_->data(), tok.data(), pos.data(), tok.numel());
+    x = &*embedded_;
   }
-  const Tensor& pos = pos_emb_->forward_indices(*pos_ids_);
-  ensure_tensor(embedded_, *ctx_, tok.shape());
-  launch_add2(stream_of(*ctx_), embedded_->data(), tok.data(), pos.data(), tok.numel());
-  const Tensor& logits = network_->forward(*embedded_);
+  const Tensor& logits = network_->forward(*x);
   forwarded_ = true;
   used_embeddings_ = true;
   return logits;
@@ -117,10 +128,11 @@ const Tensor& Transformer::decode_step(const IndexTensor& next_ids, GenerateStat
     if (cache.k.rank() != 4 || cache.k.shape()[0] != n) throw std::invalid_argument("cache");
   }
 
+  if (st.t >= transformer_config(*network_).max_seq_len) throw std::invalid_argument("max_seq_len");
+
   const Tensor& tok = tok_emb_->forward_indices(next_ids);
   const Tensor* x = &tok;
   if (pos_emb_) {
-    if (st.t >= transformer_config(*network_).max_seq_len) throw std::invalid_argument("max_seq_len");
     if (!pos_step_ids_ || pos_step_ids_->shape()[0] != n || pos_step_ids_->shape()[1] != 1) {
       pos_step_ids_.emplace(*ctx_, std::vector<int>{n, 1});
     }
@@ -188,7 +200,7 @@ const Tensor& Transformer::backward(const Tensor& grad_logits) {
   const Tensor& grad_x = network_->backward(grad_logits);
   if (used_embeddings_) {
     tok_emb_->backward(grad_x);
-    pos_emb_->backward(grad_x);
+    if (pos_emb_) pos_emb_->backward(grad_x);
   }
   return grad_x;
 }

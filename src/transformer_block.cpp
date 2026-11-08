@@ -8,6 +8,7 @@
 #include "nn/layers/gelu.hpp"
 #include "nn/layers/layer_norm.hpp"
 #include "nn/layers/linear.hpp"
+#include "nn/layers/rms_norm.hpp"
 #include "nn/layers/swiglu.hpp"
 
 #include <cmath>
@@ -51,12 +52,19 @@ TransformerBlock::TransformerBlock(Context& ctx, const TransformerBlockSpec& spe
   require_block_spec(spec);
   const bool swiglu = spec.activation == TransformerActivation::SwiGLU;
   const int fc1_out = swiglu ? spec.d_ff * 2 : spec.d_ff;
-  ln1_ = std::make_unique<LayerNorm>(ctx, spec.d_model);
-  // use_rope is not stored here. MultiHeadAttention rejects true until RoPE exists.
+  if (spec.use_rope) {
+    ln1_ = std::make_unique<RMSNorm>(ctx, spec.d_model);
+  } else {
+    ln1_ = std::make_unique<LayerNorm>(ctx, spec.d_model);
+  }
   mha_ = std::make_unique<MultiHeadAttention>(ctx, spec.d_model, spec.num_heads, true, spec.bias,
                                               spec.use_rope, rng);
   drop1_ = std::make_unique<Dropout>(ctx, spec.dropout);
-  ln2_ = std::make_unique<LayerNorm>(ctx, spec.d_model);
+  if (spec.use_rope) {
+    ln2_ = std::make_unique<RMSNorm>(ctx, spec.d_model);
+  } else {
+    ln2_ = std::make_unique<LayerNorm>(ctx, spec.d_model);
+  }
   fc1_ = std::make_unique<Linear>(ctx, spec.d_model, fc1_out, spec.bias, rng);
   if (swiglu) {
     act_ = std::make_unique<SwiGLU>(ctx);
