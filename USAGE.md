@@ -148,6 +148,7 @@ class IndexTensor {
  public:
   IndexTensor(Context& ctx, std::vector<int> shape);
   void copy_from_host(const int64_t* src, int64_t n);
+  std::vector<int64_t> to_host() const;
   const int64_t* data() const;
   const std::vector<int>& shape() const;
   int64_t numel() const;
@@ -159,7 +160,7 @@ class IndexTensor {
 
 The shape has rank 1 `(N,)` or rank 2 `(N, T)`. Every dimension is at least 1. The element count must fit in a signed 32-bit integer. A bad rank throws `index tensor rank out of range`. A bad dimension throws `index tensor dimension out of range`. An overflowing product throws `index tensor numel out of range`.
 
-`data()` is a device pointer. `copy_from_host` queues an async copy and throws `index tensor host copy numel mismatch` when `n` differs from `numel()`. Call `context().synchronize()` before reusing the host buffer. The destructor synchronizes the stream and frees the device memory. Destroy the index tensor before its context.
+`data()` is a device pointer. `copy_from_host` queues an async copy and throws `index tensor host copy numel mismatch` when `n` differs from `numel()`. Call `context().synchronize()` before reusing the host buffer. `to_host()` synchronizes, then copies the indices to a `std::vector<int64_t>`. The destructor synchronizes the stream and frees the device memory. Destroy the index tensor before its context.
 
 ## LossResult
 

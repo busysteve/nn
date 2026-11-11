@@ -68,4 +68,12 @@ void IndexTensor::copy_from_host(const int64_t* src, int64_t n) {
              "cudaMemcpyAsync");
 }
 
+std::vector<int64_t> IndexTensor::to_host() const {
+  ctx_->synchronize();
+  std::vector<int64_t> host(static_cast<size_t>(numel_));
+  check_cuda(cudaMemcpy(host.data(), data_, host.size() * sizeof(int64_t), cudaMemcpyDeviceToHost),
+             "cudaMemcpy");
+  return host;
+}
+
 }  // namespace nn
