@@ -68,11 +68,15 @@ Header: `nn/context.hpp`
 class Context {
  public:
   Context();
+  explicit Context(int device);
   void synchronize() const;
 };
+
+int device_count();
+std::string device_name(int device);
 ```
 
-`Context` is neither copyable nor movable. The constructor creates the stream, the cuDNN handle, and the cuBLAS handle on the current device. Pass the same `Context&` to every tensor, label buffer, layer, and loss that must share that stream.
+`Context` is neither copyable nor movable. `Context()` creates the stream, the cuDNN handle, and the cuBLAS handle on the current device and does not call `cudaSetDevice`. `Context(int device)` calls `cudaSetDevice` first. `device_count()` is the number of visible CUDA devices, and `device_name` is that device's name. An index outside `0 .. device_count()-1` throws `device`. Pass the same `Context&` to every tensor, label buffer, layer, and loss that must share that stream.
 
 `synchronize()` waits until work queued on that stream has finished. `Tensor::to_host()`, `kaiming_normal`, and `normal_` synchronize for you. `copy_from_host` queues an async copy, so call `synchronize()` before reusing the host buffer.
 
