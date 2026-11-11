@@ -69,14 +69,22 @@ class Context {
  public:
   Context();
   explicit Context(int device);
+  explicit Context(const std::string& choice);
   void synchronize() const;
+};
+
+struct DeviceInfo {
+  int index;
+  std::string name;
 };
 
 int device_count();
 std::string device_name(int device);
+std::vector<DeviceInfo> detect_devices();
+int select_device(const std::string& choice);
 ```
 
-`Context` is neither copyable nor movable. `Context()` creates the stream, the cuDNN handle, and the cuBLAS handle on the current device and does not call `cudaSetDevice`. `Context(int device)` calls `cudaSetDevice` first. `device_count()` is the number of visible CUDA devices, and `device_name` is that device's name. An index outside `0 .. device_count()-1` throws `device`. Pass the same `Context&` to every tensor, label buffer, layer, and loss that must share that stream.
+`Context` is neither copyable nor movable. `Context()` creates the stream, the cuDNN handle, and the cuBLAS handle on the current device and does not call `cudaSetDevice`. `Context(int device)` calls `cudaSetDevice` first. `device_count()` is the number of visible CUDA devices, and `device_name` is that device's name. An index outside `0 .. device_count()-1` throws `device`. `detect_devices()` returns those devices in index order. `select_device("auto")` is the first one. `select_device("1")` is manual. `Context(choice)` uses that result and calls `cudaSetDevice`. A blank choice, a word other than `auto`, or an index past the list throws `device`. Pass the same `Context&` to every tensor, label buffer, layer, and loss that must share that stream.
 
 `synchronize()` waits until work queued on that stream has finished. `Tensor::to_host()`, `kaiming_normal`, and `normal_` synchronize for you. `copy_from_host` queues an async copy, so call `synchronize()` before reusing the host buffer.
 

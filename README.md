@@ -9,7 +9,7 @@ The acceptance suite is MNIST. Public headers live under `include/nn/` and do no
 - C++17 and CMake 3.24 or newer
 - CUDA Toolkit (`CUDA::cudart`, `CUDA::cublas`)
 - cuDNN, found as `cudnn.h` and `libcudnn`
-- One CUDA device per `Context`. `Context()` keeps the current device and does not call `cudaSetDevice`. `Context(int device)` calls `cudaSetDevice`. `device_count()` is the number of visible devices. An index outside that range throws `device`.
+- One CUDA device per `Context`. `Context()` keeps the current device and does not call `cudaSetDevice`. `Context(int device)` calls `cudaSetDevice`. `detect_devices()` lists the visible devices. `select_device("auto")` and `Context("auto")` use the first. `select_device("1")` and `Context("1")` are manual. `device_count()` is the length of that list. An index outside it, or a choice that is neither `auto` nor a decimal index, throws `device`.
 - float32, NCHW, one non-default stream per `Context`
 
 Default GPU architecture is `86` (`CMAKE_CUDA_ARCHITECTURES`). Set `CUDNN_ROOT`, or `CUDNN_INCLUDE_DIR` and `CUDNN_LIBRARY`, when cuDNN is not on the default search path.
