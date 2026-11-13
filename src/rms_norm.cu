@@ -86,7 +86,7 @@ __global__ void rms_norm_param_grad_kernel(const float* dy, const float* x, cons
 
 int normalized_rows(const Tensor& input, int normalized_shape) {
   const std::vector<int>& shape = input.shape();
-  if ((shape.size() != 2 && shape.size() != 3) || shape.back() != normalized_shape) {
+  if (shape.size() < 2 || shape.back() != normalized_shape) {
     throw Error("RMSNorm input shape");
   }
   return static_cast<int>(input.numel() / normalized_shape);
