@@ -2,7 +2,7 @@
 
 A single-GPU C++17 library that builds and trains multilayer perceptrons, convolutional networks, basic-block ResNets, recurrent networks, and a decoder-only transformer trunk. `ConvResNet` is one network that can include a conv+pool trunk, residual stages, or both. Depth and width come from a config. Each trainable layer implements its own forward and backward pass. The network chains those layers. An MLP selects ReLU, GELU, or SwiGLU between its hidden linear layers. Training uses mean softmax cross-entropy and either SGD with momentum or AdamW. A checkpoint restores parameters, batch-norm state, the train or eval flag, and, when requested, the optimizer, so a new process can evaluate or resume training. `Network::save` writes version 1 for SGD or no optimizer and version 2 for AdamW. `Transformer::save` writes version 1 with no optimizer and version 2 with SGD kind 1.
 
-The acceptance suite is MNIST. Public headers live under `include/nn/` and do not include CUDA, cuBLAS, or cuDNN headers.
+The acceptance suite is MNIST. Public headers live under `include/nn/` and do not include CUDA, cuBLAS, or cuDNN headers. The contract shared with [nnCL](https://github.com/busysteve/nnCL) is [docs/api.md](docs/api.md).
 
 ## Requirements
 
